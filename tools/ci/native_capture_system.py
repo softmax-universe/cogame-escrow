@@ -20,27 +20,86 @@ from pathlib import Path
 from websockets.sync.client import connect
 
 
+def _find_json_object_end(text, start):
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(text)):
+        ch = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        else:
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return index
+    return -1
+
+
 def extract_final_action_object(text):
     lines = text.splitlines()
     fence_lines = [
         index for index, line in enumerate(lines) if line.strip().startswith("```")
     ]
     if not fence_lines:
-        body = text.strip()
-    else:
-        if len(fence_lines) != 2:
-            raise ValueError("expected one final fenced JSON object")
-        open_idx, close_idx = fence_lines
-        tag = lines[open_idx].strip()[3:].strip().lower()
-        if tag not in ("", "json"):
-            raise ValueError("unsupported fence tag")
+        trimmed = text.strip()
+        if not trimmed or trimmed[-1] != "}":
+            raise ValueError("no native object")
+        if trimmed[0] == "{":
+            if _find_json_object_end(trimmed, 0) != len(trimmed) - 1:
+                raise ValueError("competing or malformed bare JSON object")
+            return trimmed
+        objects = []
+        index = 0
+        while index < len(trimmed):
+            if trimmed[index] == "{":
+                end_idx = _find_json_object_end(trimmed, index)
+                if end_idx >= 0:
+                    try:
+                        parsed = json.loads(trimmed[index : end_idx + 1])
+                    except ValueError:
+                        parsed = None
+                    if isinstance(parsed, dict):
+                        objects.append((index, end_idx))
+                        index = end_idx + 1
+                        continue
+            index += 1
+        if len(objects) != 1 or objects[0][1] != len(trimmed) - 1:
+            raise ValueError("expected one trailing bare JSON object")
+        return trimmed[objects[0][0] : objects[0][1] + 1]
+    if len(fence_lines) > 2:
+        raise ValueError("expected one final fenced JSON object")
+    open_idx = fence_lines[0]
+    tag = lines[open_idx].strip()[3:].strip().lower()
+    if tag not in ("", "json"):
+        raise ValueError("unsupported fence tag")
+    if len(fence_lines) == 2:
+        close_idx = fence_lines[1]
         if lines[close_idx].strip() != "```":
             raise ValueError("invalid closing fence")
         if any(line.strip() for line in lines[close_idx + 1 :]):
             raise ValueError("trailing text after closing fence")
         body = "\n".join(lines[open_idx + 1 : close_idx]).strip()
+    else:
+        raw_body = "\n".join(lines[open_idx + 1 :]).strip()
+        ticks = 0
+        while raw_body.endswith("`") and ticks < 3:
+            raw_body = raw_body[:-1]
+            ticks += 1
+        body = raw_body.strip()
     if not body or body[0] != "{" or body[-1] != "}":
         raise ValueError("no native object")
+    if _find_json_object_end(body, 0) != len(body) - 1:
+        raise ValueError("competing JSON objects inside fence")
     return body
 
 
@@ -328,7 +387,7 @@ def check_capture(output, calls, mode):
                     "x-softmax-llm-call-id"
                 ] == cid
             assert attempt["latency_ms"] is None and wire["batch_elapsed_ms"] >= 0
-            assert attempt["decoder"] == {"max_tokens": 1100}
+            assert attempt["decoder"] == {"max_tokens": 2048}
             if attempt["accepted"]:
                 assert row["selected_attempt_id"] == attempt["attempt_id"]
                 assert attempt["parsed_action"] == row["executed_action"]
@@ -446,7 +505,7 @@ def main():
                 body = self.rfile.read(length)
                 request = json.loads(body)
                 assert request["model"] == "local/escrow-capture-sentinel"
-                assert request["max_tokens"] == 1100
+                assert request["max_tokens"] == 2048
                 slot = int(self.headers["X-Coworld-Player-Slot"])
                 assert 0 <= slot < 4
                 assert (

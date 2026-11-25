@@ -112,8 +112,8 @@
           "description": "Reply budget per seat per turn. A 240-character contract plus 600 characters of notes needs headroom; too tight and Haiku stops at max_tokens before the JSON closes.",
           "type": "integer",
           "minimum": 64,
-          "maximum": 2000,
-          "default": 1100
+          "maximum": 4096,
+          "default": 2048
         },
         "llmTimeoutSeconds": {
           "type": "integer",
