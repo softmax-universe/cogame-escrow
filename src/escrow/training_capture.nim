@@ -365,13 +365,26 @@ proc equalSupplied(raw, actual: JsonNode): bool =
     return true
   raw == actual
 
+const ActionFields* = ["give", "offer", "sign", "say", "notes"]
+
+proc hasUnambiguousAction*(raw: JsonNode): bool =
+  if raw.isNil or raw.kind != JObject: return false
+  var hasExtra = false
+  var hasAction = false
+  for key in raw.keys:
+    if key notin ActionFields: hasExtra = true
+    if key in ["give", "offer", "sign", "say"]: hasAction = true
+  not hasExtra or hasAction
+
 proc equalSuppliedAction*(raw, actual: JsonNode, talk: bool): bool =
   ## Actionable game fields (give, offer, sign) must match strictly with zero
   ## trimming or silent repair. Presentation/ancillary free text (notes, say)
   ## may legitimately be clipped/normalized by the game's display/memory bounds.
   if raw.isNil or actual.isNil or raw.kind != JObject or actual.kind != JObject:
     return false
+  if not hasUnambiguousAction(raw): return false
   for key, value in raw:
+    if key notin ActionFields: continue
     if not actual.hasKey(key): return false
     if key == "notes":
       if value.kind != JString or actual["notes"].kind != JString: return false
