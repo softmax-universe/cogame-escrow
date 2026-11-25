@@ -63,8 +63,9 @@ action. Two built-in
 the best affordable offers, post one one-for-one swap of its largest surplus
 for its largest deficit) and `hoarder` (produce, fill, do nothing else) — play
 any seat that registers as scripted. Prompt seats without a usable model
-transport, or whose replies are rejected after retries, forfeit the turn's
-actions as an empty pass (`{}`) rather than substituting a scripted bot.
+transport, or whose replies fail after retries, terminate the unfinished
+episode unscored with failure diagnostics rather than substituting a scripted
+bot or fake pass.
 
 Seats play under **anonymous cog names** (Sprocket, Gizmo, …): policy display
 names never reach the agents' prompts, so nobody can meta-game "that seat is
@@ -162,8 +163,8 @@ Or field a scripted baseline: same image, `--env PLAYER_SCRIPTED=trader` or
 External policies register with `{"type":"register","control":"external"}`
 and receive seat observations. They reply with a complete action and matching
 observation id; the game validates it under its normal rules. Invalid actions
-receive an error frame and missing or invalid turns forfeit the turn's actions
-as an empty pass (`{}`).
+receive an error frame, and missing, disconnected, or invalid turns terminate
+the unfinished episode unscored with failure diagnostics.
 
 For a local scripted episode against three traders:
 

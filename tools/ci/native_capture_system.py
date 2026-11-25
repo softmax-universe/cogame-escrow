@@ -69,17 +69,38 @@ def strict_object(text):
     return value
 
 
-def supplied_equal(raw, actual):
+def clip_text(text, limit, collapse_newlines=False):
+    if collapse_newlines:
+        text = text.replace("\n", " ")
+    text = text.strip()
+    if len(text) > limit:
+        return text[: limit - 1] + "…"
+    return text
+
+
+def supplied_equal(raw, actual, top_level=True):
     if type(raw) is not type(actual):
         return False
     if isinstance(raw, dict):
-        return all(
-            key in actual and supplied_equal(value, actual[key])
-            for key, value in raw.items()
-        )
+        for key, value in raw.items():
+            if key not in actual:
+                return False
+            if top_level and key == "notes":
+                if not isinstance(value, str) or not isinstance(actual[key], str):
+                    return False
+                if clip_text(value, 600, False) != actual[key]:
+                    return False
+            elif top_level and key == "say":
+                if not isinstance(value, str) or not isinstance(actual[key], str):
+                    return False
+                if clip_text(value, 160, True) != actual[key]:
+                    return False
+            elif not supplied_equal(value, actual[key], top_level=False):
+                return False
+        return True
     if isinstance(raw, list):
         return len(raw) == len(actual) and all(
-            supplied_equal(a, b) for a, b in zip(raw, actual)
+            supplied_equal(a, b, top_level=False) for a, b in zip(raw, actual)
         )
     return raw == actual
 
@@ -233,15 +254,20 @@ def check_capture(output, calls, mode):
         if row["event_type"] != "decision":
             continue
         statuses[row["action_status"]] += 1
-        execution = row["observation"]["native_execution"]
+        execution = row["observation"].get("native_execution")
         actor = int(row["seat"])
-        moves = [
-            event
-            for event in execution["events"]
-            if event["kind"] == "move" and event["seat"] == actor
-        ]
-        assert len(moves) == 1
-        assert execution["typed_action_projection"] == row["executed_action"]
+        if execution is not None:
+            moves = [
+                event
+                for event in execution["events"]
+                if event["kind"] == "move" and event["seat"] == actor
+            ]
+            assert len(moves) == 1
+            assert execution["typed_action_projection"] == row["executed_action"]
+        else:
+            assert mode == "errors"
+            assert row["executed_action"] is None
+            assert "native_failure" in row["observation"]
         if mode in {"rich", "normalization", "fidelity"}:
             for other in range(4):
                 if other != actor:
@@ -348,6 +374,7 @@ def check_capture(output, calls, mode):
         )
     if mode == "errors":
         assert statuses["rejected"] and rows[-1]["status"] == "failed"
+        assert rows[-1]["participant_outcomes"] is None
         assert "private capture publication failed" in (output / "game.log").read_text()
     else:
         assert rows[-1]["status"] == "completed"
@@ -506,6 +533,7 @@ def main():
         env["COGAME_SAVE_TRAJECTORY_URI"] = (
             f"http://127.0.0.1:{fixture.server_port}/private-trajectory"
         )
+        env["COGAME_PLAYER_FAILURE_URI"] = (output / "player_failure.json").as_uri()
     processes, logs = [], []
     audits = []
 
@@ -613,9 +641,30 @@ def main():
                         metrics.write(json.dumps(record) + "\n")
                     next_measurement = time.monotonic() + 1
                 time.sleep(0.2)
-            assert game.returncode == 0
+            if args.mode == "errors":
+                assert game.returncode != 0
+            else:
+                assert game.returncode == 0
         for process in processes[1:]:
             assert process.wait(timeout=10) == 0
+        if args.mode == "errors":
+            assert not (output / "results.json").exists(), (
+                "failed episode must not write numeric results.json"
+            )
+            failure = json.loads((output / "player_failure.json").read_text())
+            assert failure["status"] == "failed" and failure["failureKind"] in {
+                "infra",
+                "rejected",
+            }
+            assert not errors
+            assert (output / "trajectory.jsonl").is_file()
+            print(
+                json.dumps(
+                    {"capture_statuses": check_capture(output, calls, args.mode)}
+                )
+            )
+            print("PASS errors mode failed unscored with preserved failure evidence")
+            return
         result = json.loads((output / "results.json").read_text())
         assert result["reason"] == "complete" and result["turns"] == config["turns"], (
             result

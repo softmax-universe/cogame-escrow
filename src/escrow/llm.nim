@@ -7,18 +7,16 @@
 ## Decisions within a turn are simultaneous by rule, so the four requests
 ## go out as ONE parallel batch (curly.makeRequests); invalid replies are
 ## retried as a smaller batch carrying the exact error, and anything still
-## failing falls back to the scripted `trader` baseline.
+## failing reports a decision failure so the server terminates the unfinished
+## episode unscored rather than substituting a scripted move or fake pass.
 ##
 ## Credentials, in order of preference:
 ##   COWORLD_LLM_ENDPOINT            - hosted sidecar
 ##   Bedrock bearer token            - local play
 ##   ANTHROPIC_API_KEY                - the key itself
 ##   ANTHROPIC_API_KEY_URI            - a URI holding the key
-## With no credentials every decision falls back to the always-legal
-## scripted baseline immediately (no retries, no network waits) so offline
-## certification still completes - this fallback is load-bearing. The same
-## scripted bots are also fieldable policies: a player that registers as
-## scripted plays one deliberately, LLM or not.
+## Scripted bots (`trader` and `hoarder`) are explicit fieldable policies
+## selected by `PLAYER_SCRIPTED`; prompt seats never fall back to them.
 
 import
   std/[algorithm, json, monotimes, os, strutils, times, unicode],
@@ -55,15 +53,23 @@ type
 
   Decision* = Move
 
+  DecisionFailureKind* = enum
+    dfNone = ""
+    dfInfra = "infra"
+    dfRejected = "rejected"
+    dfMissing = "missing"
+
+  LlmInfraError* = object of EscrowError
+
   SeatDecision* = object
-    ## One seat's decision for a turn, carrying whether the scripted
-    ## baseline produced it. The flag travels WITH the decision so a seat
-    ## that exhausted its retries and fell back cannot be recorded as
-    ## having played a model's own move: the caller writes this straight
-    ## into the `move` event's `scripted` field, which is the only durable
-    ## record of a fallback.
+    ## One seat's decision for a turn, carrying whether a genuine scripted
+    ## baseline produced it or whether decision-making failed (infra, rejected,
+    ## or missing). Failed decisions are never substituted with fake moves.
     move*: Decision
     scripted*: bool
+    failed*: bool
+    failureKind*: DecisionFailureKind
+    failureReason*: string
 
   SignPick = tuple[gain: int, index: int]
 
@@ -177,7 +183,7 @@ proc newLlmClient*(config: GameConfig): LlmClient =
   else:
     result.transport = ltNone
     result.disabled = true
-    echo "escrow llm: no LLM credentials; prompt seats will pass"
+    echo "escrow llm: no LLM credentials; prompt seats cannot decide without a model transport"
 
 # ---- Scripted baselines -----------------------------------------------------
 
@@ -703,31 +709,35 @@ proc textOf(client: LlmClient, response: Response, error, url: string):
   ## is none. Auth failures disable the client; model-access and throttle
   ## failures rotate the Bedrock model for the next batch.
   if error.len > 0:
-    raise newException(EscrowError, "llm transport: " & error)
+    raise newException(LlmInfraError, "llm transport: " & error)
   if response.code == 401 or response.code == 403:
     let detail = response.body[0 .. min(response.body.high, 400)]
     if "Model access is denied" in response.body and
         client.tryNextBedrockModel("no model access"):
-      raise newException(EscrowError,
+      raise newException(LlmInfraError,
         "bedrock model access denied: " & detail)
     client.disabled = true
-    raise newException(EscrowError,
+    raise newException(LlmInfraError,
       "llm auth failed (" & $response.code & ") at " & url & ": " & detail)
   if response.code == 429:
     let detail = response.body[0 .. min(response.body.high, 300)]
     discard client.tryNextBedrockModel("throttled")
-    raise newException(EscrowError, "llm throttled (429): " & detail)
+    raise newException(LlmInfraError, "llm throttled (429): " & detail)
   if response.code < 200 or response.code >= 300:
-    raise newException(EscrowError, "anthropic error " & $response.code &
+    raise newException(LlmInfraError, "anthropic error " & $response.code &
       ": " & response.body[0 .. min(response.body.high, 300)])
-  let payload = parseJson(response.body)
+  let payload =
+    try:
+      parseJson(response.body)
+    except JsonParsingError as parseErr:
+      raise newException(LlmInfraError, "invalid provider JSON: " & parseErr.msg)
   if payload{"stop_reason"}.getStr() == "refusal":
-    raise newException(EscrowError, "anthropic refusal")
+    raise newException(LlmInfraError, "anthropic refusal")
   for contentBlock in payload["content"]:
     if contentBlock{"type"}.getStr() == "text":
       result.add(contentBlock{"text"}.getStr())
   if payload{"stop_reason"}.getStr() == "max_tokens" and '{' notin result:
-    raise newException(EscrowError, "reply cut off at max_tokens before " &
+    raise newException(LlmInfraError, "reply cut off at max_tokens before " &
       "any JSON: " & result[0 .. min(result.high, 160)].replace("\n", " "))
 
 # ---- Reply parsing ----------------------------------------------------------
@@ -849,13 +859,15 @@ proc decideAll*(
   captures: seq[CapturedDecision] = @[]
 ): seq[SeatDecision] =
   ## One decision per seat in `seats`, in order, each tagged with whether
-  ## a genuine scripted policy produced it. Rejected or unavailable model
-  ## turns forfeit their actions as an empty pass (`Move()`, `scripted: false`)
-  ## rather than substituting a scripted bot. `prompts` and `scripted` are
-  ## indexed by SEAT.
+  ## a genuine scripted policy produced it or whether decision-making failed.
+  ## Rejected or unavailable model turns are never substituted with a scripted
+  ## bot or an empty pass; callers terminate the unfinished episode unscored.
+  ## `prompts` and `scripted` are indexed by SEAT.
   result = newSeq[SeatDecision](seats.len)
   var open: seq[int]     ## indexes into `seats` still undecided
   var hints = newSeq[string](seats.len)
+  var failureKinds = newSeq[DecisionFailureKind](seats.len)
+  var failureReasons = newSeq[string](seats.len)
   for index, seat in seats:
     let kind = scripted[seat]
     if kind != skNone:
@@ -863,7 +875,12 @@ proc decideAll*(
         move: scriptedAction(sim, seat, kind),
         scripted: true)
     elif client.disabled:
-      result[index] = SeatDecision(move: Move(), scripted: false)
+      result[index] = SeatDecision(
+        move: Move(),
+        scripted: false,
+        failed: true,
+        failureKind: dfInfra,
+        failureReason: "no LLM credentials configured")
     else:
       open.add(index)
   for attempt in 0 .. 1:
@@ -912,15 +929,34 @@ proc decideAll*(
         if problem.len > 0:
           raise newException(EscrowError, problem)
         result[index] = SeatDecision(move: decision, scripted: false)
+      except LlmInfraError as error:
+        if capture != nil: capture.rejectedAttempt(error.msg)
+        echo "escrow llm: seat ", seat, " attempt ", attempt, " infra failure: ",
+          error.msg
+        hints[index] = cleanText(error.msg, 300)
+        failureKinds[index] = dfInfra
+        failureReasons[index] = error.msg
+        stillOpen.add(index)
       except CatchableError as error:
         if capture != nil: capture.rejectedAttempt(error.msg)
         echo "escrow llm: seat ", seat, " attempt ", attempt, " failed: ",
           error.msg
         hints[index] = cleanText(error.msg, 300)
+        failureKinds[index] = dfRejected
+        failureReasons[index] = error.msg
         stillOpen.add(index)
     open = stillOpen
   for index in open:
     let seat = seats[index]
-    echo "escrow llm: seat ", seat, " rejected after retries (",
-      hints[index], "); forfeiting turn as pass"
-    result[index] = SeatDecision(move: Move(), scripted: false)
+    let kind = if failureKinds[index] != dfNone: failureKinds[index] else: dfInfra
+    let reason = if failureReasons[index].len > 0: failureReasons[index]
+      elif client.disabled: "llm transport disabled"
+      else: "decision failed"
+    echo "escrow llm: seat ", seat, " failed after retries (", $kind, ": ",
+      reason, "); no substitute action"
+    result[index] = SeatDecision(
+      move: Move(),
+      scripted: false,
+      failed: true,
+      failureKind: kind,
+      failureReason: reason)

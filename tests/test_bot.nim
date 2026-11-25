@@ -7,7 +7,7 @@
 
 import std/[json, monotimes, nativesockets, net, os, strutils, times,
   unicode, unittest]
-import escrow/[llm, sim]
+import escrow/[llm, sim, training_capture]
 
 ## ---- A stub Bedrock endpoint ------------------------------------------
 ## Test 18 needs a reply that PARSES and VALIDATES: that is the only way
@@ -177,7 +177,7 @@ suite "scripted baselines":
         signedAny += traded.seats[seat].signedCount
       check signedAny > 0
 
-  test "15. decideAll passes prompt seats with no credentials while keeping genuine scripted seats":
+  test "15. decideAll fails prompt seats with no credentials while keeping genuine scripted seats":
     let config = fixture(3, turns = 8)
     let saved = [
       ("COWORLD_LLM_ENDPOINT", getEnv("COWORLD_LLM_ENDPOINT")),
@@ -193,25 +193,36 @@ suite "scripted baselines":
     check client.disabled
     var sim = initSim(config)
     let started = getMonoTime()
-    while not sim.done:
-      let seats = sim.pendingSeats()
-      let decisions = client.decideAll(sim, seats,
-        @["be bold", "", "", ""], @[skNone, skTrader, skHoarder, skNone], PromptSelection())
-      check decisions.len == seats.len
-      for index, seat in seats:
-        if seat in [1, 2]:
-          let kind = if seat == 1: skTrader else: skHoarder
-          let expected = scriptedAction(sim, seat, kind)
-          check decisions[index].scripted
-          check decisions[index].move.offer == expected.offer
-          check decisions[index].move.signs == expected.signs
-          check decisions[index].move.gives.len == expected.gives.len
-        else:
-          check not decisions[index].scripted
-          check decisions[index].move == Move()
-        sim.applyMove(seat, decisions[index].move, decisions[index].scripted)
-    check sim.reason == "complete"
-    check sim.turnsPlayed == 8
+    let seats = sim.pendingSeats()
+    let decisions = client.decideAll(sim, seats,
+      @["be bold", "", "", ""], @[skNone, skTrader, skHoarder, skNone], PromptSelection())
+    check decisions.len == seats.len
+    for index, seat in seats:
+      if seat in [1, 2]:
+        let kind = if seat == 1: skTrader else: skHoarder
+        let expected = scriptedAction(sim, seat, kind)
+        check not decisions[index].failed
+        check decisions[index].scripted
+        check decisions[index].move.offer == expected.offer
+        check decisions[index].move.signs == expected.signs
+        check decisions[index].move.gives.len == expected.gives.len
+      else:
+        check not decisions[index].scripted
+        check decisions[index].failed
+        check decisions[index].failureKind == dfInfra
+        check decisions[index].failureReason.len > 0
+    ## Genuine all-scripted episodes still complete with no network waits.
+    var scriptedSim = initSim(config)
+    while not scriptedSim.done:
+      let s = scriptedSim.pendingSeats()
+      let d = client.decideAll(scriptedSim, s, @["", "", "", ""],
+        @[skTrader, skTrader, skTrader, skHoarder], PromptSelection())
+      for idx, seat in s:
+        check not d[idx].failed
+        check d[idx].scripted
+        scriptedSim.applyMove(seat, d[idx].move, d[idx].scripted)
+    check scriptedSim.reason == "complete"
+    check scriptedSim.turnsPlayed == 8
     ## No network waits at all.
     check (getMonoTime() - started).inMilliseconds < 2000
     check parseScriptKind("trader") == skTrader
@@ -380,7 +391,7 @@ suite "scripted baselines":
       quiet.seatOfProfile[pMason])
     check hushed.say == ""
 
-  test "17. an exhausted LLM retry forfeits the turn as an empty pass, never scripted":
+  test "17. an exhausted LLM retry reports infra failure, never scripted or empty pass":
     putEnv("AWS_ENDPOINT_URL_BEDROCK_RUNTIME", "http://127.0.0.1:1")
     putEnv("AWS_BEARER_TOKEN_BEDROCK", "not-a-real-token")
     let config = fixture(9, turns = 4)
@@ -396,14 +407,9 @@ suite "scripted baselines":
     check decisions.len == seats.len
     for index, seat in seats:
       check not decisions[index].scripted
-      check decisions[index].move == Move()
-      sim.applyMove(seat, decisions[index].move, decisions[index].scripted)
-    var moves = 0
-    for event in sim.events:
-      if event.kind == evMove:
-        moves.inc
-        check not event.scripted
-    check moves == Seats
+      check decisions[index].failed
+      check decisions[index].failureKind == dfInfra
+      check decisions[index].failureReason.len > 0
 
   test "18. an accepted model reply is recorded as the model's own":
     ## The mirror of test 17, and the only test that reaches the line
@@ -548,3 +554,63 @@ suite "scripted baselines":
     ## going missing.
     let quiet = sim.signableBlock(forester)
     check "(none this turn" in quiet
+
+  test "20. clipped ancillary notes and omitted optional fields are accepted, illegal actions still rejected":
+    ## Regression for Nov 25 live escrow: valid moves whose private notes
+    ## exceed 600 runes (with optional offer/give omitted) must be accepted
+    ## by both the game decoder and native capture, while actionable fields
+    ## remain strictly checked with zero silent repair.
+    let longNotes = "Turn 3: Signing C5 and C6. " & "x".repeat(1380)
+    check longNotes.runeLen > MaxNotesLen
+    let clippedNotes = clip(longNotes, MaxNotesLen, marker = true)
+    check clippedNotes.runeLen == MaxNotesLen
+    check clippedNotes.endsWith("…")
+
+    let rawOmitted = %*{
+      "sign": ["C5", "C6"],
+      "say": "Signing both offers.",
+      "notes": longNotes
+    }
+    let appliedOmitted = %*{
+      "offer": "",
+      "sign": ["C5", "C6"],
+      "give": [],
+      "say": "Signing both offers.",
+      "notes": clippedNotes
+    }
+    check equalSuppliedAction(rawOmitted, appliedOmitted, talk = true)
+
+    ## Presentation clipping on `say` (newline collapse + 160-rune cap) is allowed
+    ## when talk is enabled, but disallowed when talk is disabled.
+    let longSay = "Line 1\n" & "s".repeat(200)
+    let appliedSay = %*{
+      "offer": "",
+      "sign": [],
+      "give": [],
+      "say": clip(longSay.replace("\n", " "), MaxSayLen, marker = true),
+      "notes": ""
+    }
+    check equalSuppliedAction(%*{"say": longSay}, appliedSay, talk = true)
+    check not equalSuppliedAction(%*{"say": longSay}, appliedSay, talk = false)
+
+    ## Actionable fields must NEVER be trimmed or silently repaired.
+    check not equalSuppliedAction(
+      %*{"sign": ["c5"]},
+      %*{"offer": "", "sign": ["C5"], "give": [], "say": "", "notes": ""},
+      talk = true
+    )
+    check not equalSuppliedAction(
+      %*{"offer": "  "},
+      %*{"offer": "", "sign": [], "give": [], "say": "", "notes": ""},
+      talk = true
+    )
+    check not equalSuppliedAction(
+      %*{"give": [{"to": "gizmo", "n": 1, "good": "ORE"}]},
+      %*{"offer": "", "sign": [], "give": [{"to": "Gizmo", "n": 1, "good": "ORE"}], "say": "", "notes": ""},
+      talk = true
+    )
+    check not equalSuppliedAction(
+      %*{"give": [{"to": "Gizmo", "n": 1, "good": "ore"}]},
+      %*{"offer": "", "sign": [], "give": [{"to": "Gizmo", "n": 1, "good": "ORE"}], "say": "", "notes": ""},
+      talk = true
+    )

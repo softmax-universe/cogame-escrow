@@ -42,11 +42,15 @@ from every copied move event and keeps only the acting seat's note command and `
 change the existing replay format or its notes visibility. The ordinary player view and prompt continue to hide other
 seats' notes.
 
-Eligibility requires a complete joined successful response and exact equality of every supplied JSON field, type, and
-value against the native installed command. The native reply extractor accepts exactly one JSON object, bare or inside
-a single ordinary outer Markdown code fence (`json` or plain), and rejects surrounding prose or extra objects; omitted
-optional fields remain eligible. Duplicate keys, non-JSON syntax, non-finite numbers, excessive
-nesting, and native normalization are excluded from targets without changing the raw completion.
+Eligibility requires a complete joined successful response and exact equality of every supplied actionable JSON field
+(`give`, `offer`, `sign`), type, and value against the native installed command. Presentation and ancillary free-text
+fields (`notes`, `say`) may legitimately be clipped or normalized to the game's display/memory bounds without marking
+a valid truthful native move rejected; raw text is preserved verbatim in attempt evidence while `native_execution`
+documents `notes_clipped`, `say_clipped`, `notes_after`, `installed_action`, and `typed_action_projection`. The native
+reply extractor accepts exactly one JSON object, bare or inside a single ordinary outer Markdown code fence (`json` or
+plain), and rejects surrounding prose or extra objects; omitted optional fields remain eligible. Duplicate keys,
+non-JSON syntax, non-finite numbers, excessive nesting, and actionable field normalization are excluded from targets
+without changing the raw completion.
 Recipient integers are compared to the installed numeric seat; recipient strings must exactly equal that seat's frozen
 alias. Case and whitespace repairs are excluded. The numeric installed action and typed comparison projection are both
 recorded; the completion is never rewritten. Failed, scripted, fallback, or incomplete attempts do not become model

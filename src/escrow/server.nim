@@ -51,6 +51,7 @@ type
     external: seq[bool]
     decisionId: int
     pendingActions: seq[JsonNode]
+    externalErrors: seq[string]
     scripted: seq[ScriptKind]
     playerSockets: Table[int, WebSocket]
     socketSlots: Table[WebSocket, int]
@@ -255,6 +256,67 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
   echo "escrow: episode complete, shutting down"
   quit(0)
 
+proc failEpisode(
+  runtimeConfig: RuntimeConfig,
+  seat: int,
+  failureKind, failureReason: string,
+  turn: int,
+  captures: seq[CapturedDecision] = @[]
+) =
+  ## Terminates an unfinished episode unscored with no invented scores, winner,
+  ## or payoff. Preserves failure diagnostics in logs, COGAME_PLAYER_FAILURE_URI
+  ## (if configured), and private trajectory capture (if configured).
+  var failurePayload: JsonNode
+  withLock stateLock:
+    if state.finished:
+      return
+    state.finished = true
+    let policyName =
+      if seat >= 0 and seat < state.config.players.len:
+        state.config.players[seat].name
+      else:
+        ""
+    failurePayload = %*{
+      "status": "failed",
+      "reason": "player_failure",
+      "failureKind": failureKind,
+      "error": failureReason,
+      "seat": seat,
+      "policy": policyName,
+      "turn": turn
+    }
+    let errorFrame = $ %*{
+      "type": "error",
+      "error": failureReason,
+      "failureKind": failureKind,
+      "seat": seat,
+      "turn": turn
+    }
+    for _, socket in state.playerSockets:
+      try:
+        socket.send(errorFrame)
+      except CatchableError:
+        discard
+    state.broadcastLocked()
+
+  echo "escrow: episode failed (", failureKind, ", seat ", seat, ", turn ",
+    turn, "): ", failureReason
+  if state.capture != nil:
+    if captures.len > 0:
+      state.capture.recordFailedTurn(captures, turn, seat, failureKind, failureReason)
+    state.capture.finishFailedCapture(failurePayload)
+  let failureUri = getEnv("COGAME_PLAYER_FAILURE_URI").strip()
+  if failureUri.len > 0:
+    try:
+      writeArtifact(
+        failureUri, $failurePayload, "application/json",
+        "COGAME_PLAYER_FAILURE_METHOD"
+      )
+    except CatchableError as error:
+      echo "escrow: failed to write player failure artifact: ", error.msg
+  sleep(200)
+  quit(1)
+
 const PlayBudgetFraction* = 0.6
   ## Share of the platform's episode timeout spent playing. The rest covers
   ## container start, player connects, and writing the artifacts — the part
@@ -273,6 +335,17 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       if allConnected:
         break
       sleep(200)
+
+    var missingSlot = -1
+    withLock stateLock:
+      if state.playerSockets.len < config.tokens.len:
+        for slot in 0 ..< config.tokens.len:
+          if not state.playerSockets.hasKey(slot):
+            missingSlot = slot
+            break
+    if missingSlot >= 0:
+      failEpisode(runtimeConfig, missingSlot, "missing",
+        "player slot " & $missingSlot & " did not connect before timeout", 0)
 
     withLock stateLock:
       state.started = true
@@ -337,6 +410,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         external = state.external
         scripted = state.scripted
         state.pendingActions = newSeq[JsonNode](config.players.len)
+        state.externalErrors = newSeq[string](config.players.len)
         inc state.decisionId
         decisionId = state.decisionId
         if state.capture != nil:
@@ -371,6 +445,10 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         else:
           decisions[index] = llmDecisions[llmIndex]
           inc llmIndex
+      for index, seat in seats:
+        if not external[seat] and decisions[index].failed:
+          failEpisode(runtimeConfig, seat, $decisions[index].failureKind,
+            decisions[index].failureReason, simCopy.turn, captures)
       let deadline = epochTime() + config.llmTimeoutSeconds.float
       while epochTime() < deadline:
         var ready = true
@@ -382,12 +460,38 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         if ready:
           break
         sleep(20)
+      var failedExternalSeat = -1
+      var failedExternalKind = ""
+      var failedExternalReason = ""
       withLock stateLock:
         for index, seat in seats:
-          if external[seat] and not state.pendingActions[seat].isNil:
-            let move = parseDecision(state.pendingActions[seat], simCopy, seat)
-            decisions[index] = SeatDecision(move: move, scripted: false)
+          if external[seat]:
+            if state.pendingActions[seat].isNil:
+              failedExternalSeat = seat
+              if state.externalErrors[seat].len > 0:
+                failedExternalKind = "rejected"
+                failedExternalReason = state.externalErrors[seat]
+              elif not state.playerSockets.hasKey(seat):
+                failedExternalKind = "missing"
+                failedExternalReason = "external player disconnected"
+              else:
+                failedExternalKind = "missing"
+                failedExternalReason = "external player timed out without submitting a valid action"
+              break
+            try:
+              let move = parseDecision(state.pendingActions[seat], simCopy, seat)
+              decisions[index] = SeatDecision(move: move, scripted: false)
+            except CatchableError as error:
+              failedExternalSeat = seat
+              failedExternalKind = "rejected"
+              failedExternalReason = error.msg
+              break
+      if failedExternalSeat >= 0:
+        failEpisode(runtimeConfig, failedExternalSeat, failedExternalKind,
+          failedExternalReason, simCopy.turn, captures)
 
+      var applyFailedSeat = -1
+      var applyFailedReason = ""
       withLock stateLock:
         let beforeEvents = if state.capture != nil: state.sim.events.len else: 0
         for index, seat in seats:
@@ -403,15 +507,19 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
           try:
             state.sim.applyMove(seat, decision, wasScripted)
           except EscrowError as error:
-            echo "escrow: reply rejected (", error.msg,
-              "); forfeiting turn as pass"
-            state.sim.applyMove(seat, Move(), false)
-        if state.capture != nil:
-          try:
-            state.capture.appliedTurn(captures, simCopy.turn, state.sim,
-              state.sim.events[beforeEvents ..< state.sim.events.len])
-          except CatchableError as error: state.capture.captureError(error.msg)
-        state.broadcastLocked()
+            applyFailedSeat = seat
+            applyFailedReason = error.msg
+            break
+        if applyFailedSeat < 0:
+          if state.capture != nil:
+            try:
+              state.capture.appliedTurn(captures, simCopy.turn, state.sim,
+                state.sim.events[beforeEvents ..< state.sim.events.len])
+            except CatchableError as error: state.capture.captureError(error.msg)
+          state.broadcastLocked()
+      if applyFailedSeat >= 0:
+        failEpisode(runtimeConfig, applyFailedSeat, "rejected",
+          applyFailedReason, simCopy.turn, captures)
 
       ## Pace between turns so spectators can read the floor.
       if config.turnDelayMs > 0:
@@ -573,6 +681,9 @@ proc websocketHandler(
             (if scripted != skNone: ", scripted " & $scripted else: ""), ")"
       except CatchableError as error:
         echo "escrow: ignoring bad player frame: ", error.msg
+        withLock stateLock:
+          if slot >= 0 and slot < state.externalErrors.len and state.external[slot]:
+            state.externalErrors[slot] = error.msg
         try:
           websocket.send($ %*{"type": "error", "error": error.msg})
         except CatchableError:
@@ -647,6 +758,7 @@ proc runGameServer*(config: GameConfig, runtimeConfig: RuntimeConfig) =
   state.prompts = newSeq[string](config.players.len)
   state.external = newSeq[bool](config.players.len)
   state.pendingActions = newSeq[JsonNode](config.players.len)
+  state.externalErrors = newSeq[string](config.players.len)
   state.scripted = newSeq[ScriptKind](config.players.len)
   runtimeConfigGlobal = runtimeConfig
 
