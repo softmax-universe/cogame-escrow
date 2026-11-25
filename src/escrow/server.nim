@@ -25,7 +25,7 @@
 ##                             "observation":{...seat state...}}
 ##   external player -> game: {"type":"action","id":N,"action":{...}}
 ##                   (max 4000 chars; scripted plays a built-in baseline
-##                   for that seat: "trader" / "1", or "hoarder")
+##                   for that seat: "trader" or "hoarder")
 
 import
   std/[json, locks, os, sets, strutils, tables, times, unicode],
@@ -49,8 +49,10 @@ type
     capture: RuntimeCapture
     prompts: seq[string]
     external: seq[bool]
+    registered: seq[bool]
     decisionId: int
     pendingActions: seq[JsonNode]
+    externalErrors: seq[string]
     scripted: seq[ScriptKind]
     playerSockets: Table[int, WebSocket]
     socketSlots: Table[WebSocket, int]
@@ -255,6 +257,67 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
   echo "escrow: episode complete, shutting down"
   quit(0)
 
+proc failEpisode(
+  runtimeConfig: RuntimeConfig,
+  seat: int,
+  failureKind, failureReason: string,
+  turn: int,
+  captures: seq[CapturedDecision] = @[]
+) =
+  ## Terminates an unfinished episode unscored with no invented scores, winner,
+  ## or payoff. Preserves failure diagnostics in logs, COGAME_PLAYER_FAILURE_URI
+  ## (if configured), and private trajectory capture (if configured).
+  var failurePayload: JsonNode
+  withLock stateLock:
+    if state.finished:
+      return
+    state.finished = true
+    let policyName =
+      if seat >= 0 and seat < state.config.players.len:
+        state.config.players[seat].name
+      else:
+        ""
+    failurePayload = %*{
+      "status": "failed",
+      "reason": "player_failure",
+      "failureKind": failureKind,
+      "error": failureReason,
+      "seat": seat,
+      "policy": policyName,
+      "turn": turn
+    }
+    let errorFrame = $ %*{
+      "type": "error",
+      "error": failureReason,
+      "failureKind": failureKind,
+      "seat": seat,
+      "turn": turn
+    }
+    for _, socket in state.playerSockets:
+      try:
+        socket.send(errorFrame)
+      except CatchableError:
+        discard
+    state.broadcastLocked()
+
+  echo "escrow: episode failed (", failureKind, ", seat ", seat, ", turn ",
+    turn, "): ", failureReason
+  if state.capture != nil:
+    if captures.len > 0:
+      state.capture.recordFailedTurn(captures, turn, seat, failureKind, failureReason)
+    state.capture.finishFailedCapture(failurePayload)
+  let failureUri = getEnv("COGAME_PLAYER_FAILURE_URI").strip()
+  if failureUri.len > 0:
+    try:
+      writeArtifact(
+        failureUri, $failurePayload, "application/json",
+        "COGAME_PLAYER_FAILURE_METHOD"
+      )
+    except CatchableError as error:
+      echo "escrow: failed to write player failure artifact: ", error.msg
+  sleep(200)
+  quit(1)
+
 const PlayBudgetFraction* = 0.6
   ## Share of the platform's episode timeout spent playing. The rest covers
   ## container start, player connects, and writing the artifacts — the part
@@ -267,12 +330,32 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
     let deadline = gameStart + config.playerConnectTimeoutSeconds
 
     while epochTime() < deadline:
-      var allConnected = false
+      var allReady = false
       withLock stateLock:
-        allConnected = state.playerSockets.len >= config.tokens.len
-      if allConnected:
+        if state.playerSockets.len >= config.tokens.len:
+          allReady = true
+          for slot in 0 ..< config.tokens.len:
+            if not state.registered[slot]:
+              allReady = false
+              break
+      if allReady:
         break
-      sleep(200)
+      sleep(50)
+
+    var missingSlot = -1
+    var missingReason = ""
+    withLock stateLock:
+      for slot in 0 ..< config.tokens.len:
+        if not state.playerSockets.hasKey(slot):
+          missingSlot = slot
+          missingReason = "player slot " & $slot & " did not connect before timeout"
+          break
+        if not state.registered[slot]:
+          missingSlot = slot
+          missingReason = "player slot " & $slot & " connected but did not register before timeout"
+          break
+    if missingSlot >= 0:
+      failEpisode(runtimeConfig, missingSlot, "missing", missingReason, 0)
 
     withLock stateLock:
       state.started = true
@@ -316,6 +399,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       var decisionId: int
       var scripted: seq[ScriptKind]
       var captures: seq[CapturedDecision]
+      var llmSeats: seq[int]
       withLock stateLock:
         if state.sim.done:
           break
@@ -336,6 +420,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         external = state.external
         scripted = state.scripted
         state.pendingActions = newSeq[JsonNode](config.players.len)
+        state.externalErrors = newSeq[string](config.players.len)
         inc state.decisionId
         decisionId = state.decisionId
         if state.capture != nil:
@@ -348,19 +433,32 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
                 state.playerStateJson(seat), state.selection.selectionMetadata(), preHash)
           except CatchableError as error: state.capture.captureError(error.msg)
         for seat in seats:
-          if external[seat] and state.playerSockets.hasKey(seat):
-            state.playerSockets[seat].send($ %*{
-              "type": "observation", "id": decisionId,
-              "observation": state.playerStateJson(seat)})
           if external[seat]:
-            scripted[seat] = skTrader
+            if state.playerSockets.hasKey(seat):
+              state.playerSockets[seat].send($ %*{
+                "type": "observation", "id": decisionId,
+                "observation": state.playerStateJson(seat)})
+          else:
+            llmSeats.add(seat)
         echo "escrow: turn ", state.sim.turn, " of ", config.turns,
           " at ", (epochTime() - gameStart).int, "s"
 
       ## Model requests (ONE parallel batch for the turn) run
       ## outside the lock on a snapshot; only this thread mutates the sim,
       ## so the snapshot cannot go stale.
-      var decisions = client.decideAll(simCopy, seats, prompts, scripted, state.selection, captures)
+      let llmDecisions = client.decideAll(simCopy, llmSeats, prompts, scripted, state.selection, captures)
+      var decisions = newSeq[SeatDecision](seats.len)
+      var llmIndex = 0
+      for index, seat in seats:
+        if external[seat]:
+          decisions[index] = SeatDecision(move: Move(), scripted: false)
+        else:
+          decisions[index] = llmDecisions[llmIndex]
+          inc llmIndex
+      for index, seat in seats:
+        if not external[seat] and decisions[index].failed:
+          failEpisode(runtimeConfig, seat, $decisions[index].failureKind,
+            decisions[index].failureReason, simCopy.turn, captures)
       let deadline = epochTime() + config.llmTimeoutSeconds.float
       while epochTime() < deadline:
         var ready = true
@@ -372,19 +470,42 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         if ready:
           break
         sleep(20)
+      var failedExternalSeat = -1
+      var failedExternalKind = ""
+      var failedExternalReason = ""
       withLock stateLock:
         for index, seat in seats:
-          if external[seat] and not state.pendingActions[seat].isNil:
-            let move = parseDecision(state.pendingActions[seat], simCopy, seat)
-            decisions[index] = SeatDecision(move: move, scripted: false)
+          if external[seat]:
+            if state.pendingActions[seat].isNil:
+              failedExternalSeat = seat
+              if state.externalErrors[seat].len > 0:
+                failedExternalKind = "rejected"
+                failedExternalReason = state.externalErrors[seat]
+              elif not state.playerSockets.hasKey(seat):
+                failedExternalKind = "missing"
+                failedExternalReason = "external player disconnected"
+              else:
+                failedExternalKind = "missing"
+                failedExternalReason = "external player timed out without submitting a valid action"
+              break
+            try:
+              let move = parseDecision(state.pendingActions[seat], simCopy, seat)
+              decisions[index] = SeatDecision(move: move, scripted: false)
+            except CatchableError as error:
+              failedExternalSeat = seat
+              failedExternalKind = "rejected"
+              failedExternalReason = error.msg
+              break
+      if failedExternalSeat >= 0:
+        failEpisode(runtimeConfig, failedExternalSeat, failedExternalKind,
+          failedExternalReason, simCopy.turn, captures)
 
+      var applyFailedSeat = -1
+      var applyFailedReason = ""
       withLock stateLock:
         let beforeEvents = if state.capture != nil: state.sim.events.len else: 0
         for index, seat in seats:
           let decision = decisions[index].move
-          ## Not the registration state: `decideAll` reports the baseline
-          ## it actually played, including a seat whose LLM attempts both
-          ## failed, so the replay's `scripted` flag counts every fallback.
           let wasScripted = decisions[index].scripted
           echo "escrow: turn ", state.sim.turn, " ", state.sim.names[seat],
             " (", state.sim.profileName(seat), ") gives ",
@@ -396,16 +517,19 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
           try:
             state.sim.applyMove(seat, decision, wasScripted)
           except EscrowError as error:
-            echo "escrow: reply rejected (", error.msg,
-              "); using the trader baseline"
-            let fallback = scriptedAction(state.sim, seat, skTrader)
-            state.sim.applyMove(seat, fallback, true)
-        if state.capture != nil:
-          try:
-            state.capture.appliedTurn(captures, simCopy.turn, state.sim,
-              state.sim.events[beforeEvents ..< state.sim.events.len])
-          except CatchableError as error: state.capture.captureError(error.msg)
-        state.broadcastLocked()
+            applyFailedSeat = seat
+            applyFailedReason = error.msg
+            break
+        if applyFailedSeat < 0:
+          if state.capture != nil:
+            try:
+              state.capture.appliedTurn(captures, simCopy.turn, state.sim,
+                state.sim.events[beforeEvents ..< state.sim.events.len])
+            except CatchableError as error: state.capture.captureError(error.msg)
+          state.broadcastLocked()
+      if applyFailedSeat >= 0:
+        failEpisode(runtimeConfig, applyFailedSeat, "rejected",
+          applyFailedReason, simCopy.turn, captures)
 
       ## Pace between turns so spectators can read the floor.
       if config.turnDelayMs > 0:
@@ -537,12 +661,13 @@ proc websocketHandler(
             raise newException(EscrowError, "unknown player control")
           withLock stateLock:
             state.external[slot] = true
+            state.registered[slot] = true
           return
         if payload{"type"}.getStr() == "action":
           withLock stateLock:
-            if state.external[slot] and payload["id"].getInt() ==
+            if state.external[slot] and payload{"id"}.getInt(-1) ==
                 state.decisionId and state.pendingActions[slot].isNil:
-              let action = payload["action"]
+              let action = payload{"action"}
               let move = parseDecision(action, state.sim, slot)
               let problem = state.sim.validateMove(slot, move)
               if problem.len > 0:
@@ -556,18 +681,25 @@ proc websocketHandler(
           let node = payload{"scripted"}
           let scripted =
             if node.isNil: skNone
-            elif node.kind == JBool: (if node.getBool(): skTrader
-              else: skNone)
-            else: parseScriptKind(node.getStr())
+            elif node.kind == JString: parseScriptKind(node.getStr())
+            else: raise newException(EscrowError, "scripted must be a string")
           withLock stateLock:
             state.prompts[slot] = prompt
             state.external[slot] = false
             state.scripted[slot] = scripted
+            state.registered[slot] = true
           echo "escrow: slot ", slot, " delivered a prompt (",
             prompt.len, " chars",
             (if scripted != skNone: ", scripted " & $scripted else: ""), ")"
       except CatchableError as error:
         echo "escrow: ignoring bad player frame: ", error.msg
+        withLock stateLock:
+          if slot >= 0 and slot < state.externalErrors.len and state.external[slot]:
+            state.externalErrors[slot] = error.msg
+        try:
+          websocket.send($ %*{"type": "error", "error": error.msg})
+        except CatchableError:
+          discard
     of ErrorEvent:
       discard
     of CloseEvent:
@@ -637,7 +769,9 @@ proc runGameServer*(config: GameConfig, runtimeConfig: RuntimeConfig) =
   state.capture = newRuntimeCapture(state.sim, runtimeConfig.resultsUri, runtimeConfig.replayUri)
   state.prompts = newSeq[string](config.players.len)
   state.external = newSeq[bool](config.players.len)
+  state.registered = newSeq[bool](config.players.len)
   state.pendingActions = newSeq[JsonNode](config.players.len)
+  state.externalErrors = newSeq[string](config.players.len)
   state.scripted = newSeq[ScriptKind](config.players.len)
   runtimeConfigGlobal = runtimeConfig
 

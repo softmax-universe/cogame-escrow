@@ -257,48 +257,35 @@ suite "the contract language":
       " 4 GRAIN\nTHEN PROPOSER\nELSE KEEP"
     check renderContract(sim, second.contract) == first.contract.text
 
-  test "4b. an offer is found under a stray alias line and past its ELSE":
-    ## Hosted rounds showed mid-size models topping the offer with the
-    ## addressee's alias on its own line ("syntax: line 1 must start with
-    ## OFFER") and tailing it with a word of explanation. Both are
-    ## formatting, not semantics, so the seven lines are simply located
-    ## inside the text; everything between them is parsed exactly as
-    ## before.
+  test "4b. stray lines before OFFER or prose after ELSE are rejected":
     let sim = initSim(fixtureConfig(turns = 16, seed = 5))
     let me = sim.seatOfProfile[pMason]
     let you = sim.seatOfProfile[pFarmer]
     let clean = sim.offerText(you, "5 ORE", "5 GRAIN", "2", "ALWAYS", "SWAP",
       "KEEP")
-    let wanted = parseContract(clean, sim, me)
-    check wanted.ok
+    check parseContract(clean, sim, me).ok
 
-    ## A well-formed offer is untouched.
-    check normalizeOfferText(clean) == clean
-
-    ## Junk above the OFFER line goes.
+    ## Junk above the OFFER line is rejected.
     let topped = sim.names[you].toUpperAscii() & "\n\n" & clean
-    check normalizeOfferText(topped) == clean
-    let toppedParse = parseContract(topped, sim, me)
-    check toppedParse.ok
-    check toppedParse.contract.text == wanted.contract.text
+    check parseContract(topped, sim, me).reason == "syntax"
 
-    ## Prose below the ELSE line goes.
+    ## Prose below the ELSE line is rejected.
     let tailed = clean & "\nThis pays you 5 grain for 5 ore, due turn 2."
-    check normalizeOfferText(tailed) == clean
-    let tailedParse = parseContract(tailed, sim, me)
-    check tailedParse.ok
-    check tailedParse.contract.text == wanted.contract.text
+    check parseContract(tailed, sim, me).reason == "syntax"
 
-    ## Both at once, and still the same board text.
+    ## Both at once are rejected.
     let both = "Here is my offer to " & sim.names[you] & ":\n" & topped &
       "\nSign it and we both fill twice."
-    check parseContract(both, sim, me).contract.text == wanted.contract.text
+    check parseContract(both, sim, me).reason == "syntax"
 
-    ## Text with no OFFER line at all is left alone and rejected as before.
+    ## Singular HEART alias is rejected; HEARTS is required.
+    check parseContract(sim.offerText(you, "5 ORE", "5 HEART", "2", "ALWAYS",
+      "SWAP", "KEEP"), sim, me).reason == "bad_bundle"
+
+    ## Text with no OFFER line at all is rejected.
     let noOffer = "I would rather hold my ore this turn."
-    check normalizeOfferText(noOffer) == noOffer
     check parseContract(noOffer, sim, me).reason == "syntax"
-    ## Trimming cannot rescue an over-long submission.
+    ## Over-long submission is rejected.
     check parseContract(clean & "\n" & "x".repeat(250), sim, me).reason ==
       "too_long"
 

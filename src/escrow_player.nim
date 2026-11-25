@@ -2,7 +2,7 @@
 ##
 ## Prompt and scripted policies register with the game's existing adapters.
 ##
-## PLAYER_SCRIPTED=trader (or 1) registers the seat as the built-in trading
+## PLAYER_SCRIPTED=trader registers the seat as the built-in trading
 ## baseline instead; PLAYER_SCRIPTED=hoarder as the autarky foil. The
 ## server plays those deterministically, no LLM.
 ##

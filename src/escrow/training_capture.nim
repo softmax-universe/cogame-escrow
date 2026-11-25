@@ -365,6 +365,27 @@ proc equalSupplied(raw, actual: JsonNode): bool =
     return true
   raw == actual
 
+proc equalSuppliedAction*(raw, actual: JsonNode, talk: bool): bool =
+  ## Actionable game fields (give, offer, sign) must match strictly with zero
+  ## trimming or silent repair. Presentation/ancillary free text (notes, say)
+  ## may legitimately be clipped/normalized by the game's display/memory bounds.
+  if raw.isNil or actual.isNil or raw.kind != JObject or actual.kind != JObject:
+    return false
+  for key, value in raw:
+    if not actual.hasKey(key): return false
+    if key == "notes":
+      if value.kind != JString or actual["notes"].kind != JString: return false
+      if clip(value.getStr(), MaxNotesLen, marker = true) != actual["notes"].getStr():
+        return false
+    elif key == "say":
+      if value.kind != JString or actual["say"].kind != JString: return false
+      if not talk and value.getStr().strip().len > 0: return false
+      if clip(value.getStr().replace("\n", " "), MaxSayLen, marker = true) != actual["say"].getStr():
+        return false
+    else:
+      if not equalSupplied(value, actual[key]): return false
+  true
+
 proc installedJson(event: GameEvent, notes: string): JsonNode =
   var gives = newJArray()
   for order in event.gives:
@@ -399,7 +420,7 @@ proc recordApplied(capture: RuntimeCapture, decision: CapturedDecision,
     var strict = false
     if decision.attempts.len > 0:
       try:
-        # generated stores the exact substring from native firstJsonObject, never a repaired label.
+        # generated stores the exact substring from native extractJsonObjectText, never a repaired label.
         raw = strictRawObject(decision.generated[^1])
         strict = true
       except CatchableError: discard
@@ -413,30 +434,38 @@ proc recordApplied(capture: RuntimeCapture, decision: CapturedDecision,
             actual["give"][index]["to"] = %sim.names[order.to]
           recipients.add(%*{"index": index, "actual_seat": order.to,
             "actual_alias": sim.names[order.to], "supplied_type": $original["to"].kind})
+    let notesClipped = strict and raw.hasKey("notes") and raw["notes"].kind == JString and
+      raw["notes"].getStr() != actual["notes"].getStr() and
+      clip(raw["notes"].getStr(), MaxNotesLen, marker = true) == actual["notes"].getStr()
+    let sayClipped = strict and raw.hasKey("say") and raw["say"].kind == JString and
+      raw["say"].getStr() != actual["say"].getStr() and
+      clip(raw["say"].getStr().replace("\n", " "), MaxSayLen, marker = true) == actual["say"].getStr()
     decision.observation["native_execution"] = %*{
       "turn": turn, "installed_action": numeric, "typed_action_projection": actual,
       "recipient_encodings": recipients, "notes_after": move.text,
+      "notes_clipped": notesClipped, "say_clipped": sayClipped,
       "scripted": move.scripted, "events": eventRows,
       "events_sha256": sha256($eventRows).toHex.toLowerAscii(),
       "post_native_sha256": nativeStateHash(sim)}
     var selected = none(string)
     var status = asMissing
-    if move.scripted and decision.policy == "prompt": status = asFallback
-    elif not move.scripted and decision.policy == "prompt":
-      status = asRejected
+    if not move.scripted and decision.policy == "prompt":
       if decision.attempts.len > 0:
+        status = asRejected
         var evidence = addr decision.attempts[^1]
-        evidence.parsedAction = copy(actual)
-        evidence.accepted = not decision.failed and evidence.rejectionReason.isNone and
-          evidence.responseComplete == some(true) and evidence.responseReaderJoined == some(true) and
-          evidence.httpStatus.isSome and evidence.httpStatus.get() in 200 .. 299 and
-          evidence.rawResponse.kind == JString and evidence.responseBodyB64.isSome and
-          evidence.responseHeaders.isSome and strict and equalSupplied(raw, actual)
-        if evidence.accepted:
-          selected = some(evidence.attemptId)
-          status = asAccepted
-        else:
-          evidence.rejectionReason = some("strict JSON grammar/depth or supplied field/type/value differs from installed command")
+        if evidence.rejectionReason.isNone:
+          evidence.parsedAction = copy(actual)
+          evidence.accepted = not decision.failed and
+            evidence.responseComplete == some(true) and evidence.responseReaderJoined == some(true) and
+            evidence.httpStatus.isSome and evidence.httpStatus.get() in 200 .. 299 and
+            evidence.rawResponse.kind == JString and evidence.responseBodyB64.isSome and
+            evidence.responseHeaders.isSome and strict and
+            equalSuppliedAction(raw, actual, sim.config.talk)
+          if evidence.accepted:
+            selected = some(evidence.attemptId)
+            status = asAccepted
+          else:
+            evidence.rejectionReason = some("strict JSON grammar/depth or supplied field/type/value differs from installed command")
     var originalAttempts = newJArray()
     for evidence in decision.attempts: originalAttempts.add(attemptEvidenceJson(evidence))
     let original = %*{"observation": decision.observation, "attempts": originalAttempts,
@@ -474,6 +503,66 @@ proc appliedTurn*(capture: RuntimeCapture, decisions: seq[CapturedDecision],
   if capture == nil: return
   for seat, decision in decisions:
     if decision != nil: capture.recordApplied(decision, seat, turn, sim, events)
+
+proc recordFailedTurn*(capture: RuntimeCapture, decisions: seq[CapturedDecision],
+    turn, failedSeat: int, failureKind, failureReason: string) =
+  ## Records an unapplied turn when decision-making failed so private evidence
+  ## retains all attempts and failure diagnostics without inventing an action.
+  if capture == nil: return
+  for seat, decision in decisions:
+    if decision == nil: continue
+    try:
+      decision.observation["native_failure"] = %*{
+        "turn": turn,
+        "seat": seat,
+        "failed_seat": failedSeat,
+        "failure_kind": failureKind,
+        "failure_reason": safeDiagnostic(failureReason)
+      }
+      var status = asMissing
+      if decision.attempts.len > 0:
+        status = asRejected
+        if decision.attempts[^1].rejectionReason.isNone and seat == failedSeat:
+          decision.attempts[^1].rejectionReason = some(safeDiagnostic(failureReason))
+      var originalAttempts = newJArray()
+      for evidence in decision.attempts: originalAttempts.add(attemptEvidenceJson(evidence))
+      let original = %*{"observation": decision.observation, "attempts": originalAttempts,
+        "executed_action": newJNull()}
+      if not scalarJson(original):
+        let detail = "non-Unicode native evidence; original JSON bytes retained as base64; target excluded"
+        decision.observation = %*{"capture_errors": [detail],
+          "invalid_native_evidence_json_b64": encode($original)}
+        decision.attempts = @[]
+        decision.failed = true
+        status = asRejected
+      if decision.failed:
+        capture.failed = true
+        if decision.observation.hasKey("capture_errors"):
+          for error in decision.observation["capture_errors"]:
+            if capture.errors.len < 16: capture.errors.add(error.getStr())
+      capture.trajectory.recordDecision(decision.id, $seat, decision.observation,
+        decision.attempts, none(string), newJNull(), status)
+    except CatchableError as error:
+      capture.captureError("failed-turn evidence failed: " & error.msg)
+
+proc finishFailedCapture*(capture: RuntimeCapture, failureOutcome: JsonNode) =
+  ## Finishes private capture for a failed/unfinished episode with no scores.
+  if capture == nil: return
+  try:
+    if capture.trajectory == nil:
+      raise newException(ValueError, "trajectory initialization failed")
+    var privateOutcome = copy(failureOutcome)
+    if not scalarJson(privateOutcome):
+      capture.captureError("non-Unicode failure outcome; original JSON bytes retained as base64")
+      privateOutcome = %*{"invalid_native_outcome_json_b64": encode($failureOutcome)}
+    if capture.failed:
+      privateOutcome["capture_errors"] = %capture.errors
+    capture.trajectory.finish(esFailed, privateOutcome, newJNull())
+    if capture.trajectory.eventsJsonl().len > MaxEpisodeEvidenceBytes:
+      raise newException(ValueError, "private episode exceeds 24 MiB; publication omitted, no truncation")
+    capture.trajectory.writeEventsToUri(getEnv(CogameSaveTrajectoryUriEnv))
+  except CatchableError as error:
+    echo "escrow: private capture publication failed: ", error.msg
 
 proc finishCapture*(capture: RuntimeCapture, outcome: JsonNode) =
   if capture == nil: return

@@ -7,21 +7,19 @@
 ## Decisions within a turn are simultaneous by rule, so the four requests
 ## go out as ONE parallel batch (curly.makeRequests); invalid replies are
 ## retried as a smaller batch carrying the exact error, and anything still
-## failing falls back to the scripted `trader` baseline.
+## failing reports a decision failure so the server terminates the unfinished
+## episode unscored rather than substituting a scripted move or fake pass.
 ##
 ## Credentials, in order of preference:
 ##   COWORLD_LLM_ENDPOINT            - hosted sidecar
 ##   Bedrock bearer token            - local play
 ##   ANTHROPIC_API_KEY                - the key itself
 ##   ANTHROPIC_API_KEY_URI            - a URI holding the key
-## With no credentials every decision falls back to the always-legal
-## scripted baseline immediately (no retries, no network waits) so offline
-## certification still completes - this fallback is load-bearing. The same
-## scripted bots are also fieldable policies: a player that registers as
-## scripted plays one deliberately, LLM or not.
+## Scripted bots (`trader` and `hoarder`) are explicit fieldable policies
+## selected by `PLAYER_SCRIPTED`; prompt seats never fall back to them.
 
 import
-  std/[algorithm, json, math, monotimes, os, strutils, times, unicode],
+  std/[algorithm, json, monotimes, os, strutils, times, unicode],
   bitworld/runtime,
   curly,
   sim, prompts, training_capture
@@ -55,15 +53,23 @@ type
 
   Decision* = Move
 
+  DecisionFailureKind* = enum
+    dfNone = ""
+    dfInfra = "infra"
+    dfRejected = "rejected"
+    dfMissing = "missing"
+
+  LlmInfraError* = object of EscrowError
+
   SeatDecision* = object
-    ## One seat's decision for a turn, carrying whether the scripted
-    ## baseline produced it. The flag travels WITH the decision so a seat
-    ## that exhausted its retries and fell back cannot be recorded as
-    ## having played a model's own move: the caller writes this straight
-    ## into the `move` event's `scripted` field, which is the only durable
-    ## record of a fallback.
+    ## One seat's decision for a turn, carrying whether a genuine scripted
+    ## baseline produced it or whether decision-making failed (infra, rejected,
+    ## or missing). Failed decisions are never substituted with fake moves.
     move*: Decision
     scripted*: bool
+    failed*: bool
+    failureKind*: DecisionFailureKind
+    failureReason*: string
 
   SignPick = tuple[gain: int, index: int]
 
@@ -76,22 +82,19 @@ type
     apiKey: string          ## anthropic transport
     sidecarEndpoint: string
     bedrockEndpoint: string ## local Bedrock transport
-    bedrockModels: seq[string]  ## candidates, tried in order on denial
-    bedrockModel: int           ## index into bedrockModels
+    bedrockModelId: string  ## single configured Bedrock model id (no fallback)
     bedrockToken: string
-    model: string         ## direct-Anthropic transport only; Bedrock
-                          ## picks from bedrockModels instead
+    model: string         ## direct-Anthropic or sidecar model id
     maxOutputTokens: int
     timeoutSeconds: int
     disabled*: bool   ## true once credentials are known-unavailable
 
 proc parseScriptKind*(text: string): ScriptKind =
-  ## PLAYER_SCRIPTED values: "1"/"true"/"yes"/"trader" play the trading
-  ## baseline, "hoarder"/"autarky" the do-nothing foil, anything else
-  ## nothing.
+  ## PLAYER_SCRIPTED values: "trader" plays the trading baseline, "hoarder"
+  ## the autarky foil, anything else none.
   case text.strip().toLowerAscii()
-  of "1", "true", "yes", "trader": skTrader
-  of "hoarder", "autarky": skHoarder
+  of "trader": skTrader
+  of "hoarder": skHoarder
   else: skNone
 
 proc resolveApiKey(): string =
@@ -107,38 +110,19 @@ proc resolveApiKey(): string =
     echo "escrow llm: failed to fetch ANTHROPIC_API_KEY_URI: ", error.msg
     result = ""
 
-proc bedrockModelIds(): seq[string] =
-  ## Bedrock inference-profile candidates, tried in order. BEDROCK_MODEL
-  ## pins a single id; without it, fall through this list — model access is
-  ## a per-account Marketplace subscription, so an id that works in one
-  ## account 403s in another. The config "model" field is NOT
-  ## consulted here: it applies to the direct-Anthropic transport
-  ## only, and the haiku-first ordering below is a shared-capacity
-  ## decision that trumps per-game preference.
+const
+  DefaultBedrockModel* = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+
+proc bedrockModelId(): string =
+  ## Single Bedrock inference-profile id. BEDROCK_MODEL overrides the
+  ## default; there is no alternate-model fallback rotation.
   let pinned = getEnv("BEDROCK_MODEL").strip()
   if pinned.len > 0:
-    return @[pinned]
-  ## Haiku leads: hosted Bedrock capacity is shared account-wide and the
-  ## sonnet profiles run out of daily tokens first.
-  @[
-    "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-    "us.anthropic.claude-sonnet-4-6",
-    "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
-  ]
-
-proc tryNextBedrockModel(client: LlmClient, why: string): bool =
-  if client.transport != ltBedrock or
-      client.bedrockModel + 1 >= client.bedrockModels.len:
-    return false
-  client.bedrockModel.inc
-  echo "escrow llm: ", client.bedrockModels[client.bedrockModel - 1],
-    " unusable (", why, "); falling back to ",
-    client.bedrockModels[client.bedrockModel]
-  true
+    return pinned
+  DefaultBedrockModel
 
 proc bedrockUrl(client: LlmClient): string =
-  client.bedrockEndpoint & "/model/" &
-    client.bedrockModels[client.bedrockModel] & "/invoke"
+  client.bedrockEndpoint & "/model/" & client.bedrockModelId & "/invoke"
 
 proc newLlmClient*(config: GameConfig): LlmClient =
   result = LlmClient(
@@ -163,11 +147,11 @@ proc newLlmClient*(config: GameConfig): LlmClient =
       else: "https://bedrock-runtime." & region & ".amazonaws.com"
     result.transport = ltBedrock
     result.bedrockEndpoint = endpoint.strip(chars = {'/'}, leading = false)
-    result.bedrockModels = bedrockModelIds()
+    result.bedrockModelId = bedrockModelId()
     result.bedrockToken = bedrockToken
     result.curl = newCurly()
     echo "escrow llm: bedrock transport, model ",
-      result.bedrockModels[result.bedrockModel],
+      result.bedrockModelId,
       ", url ", result.bedrockUrl
     return
   result.apiKey = resolveApiKey()
@@ -178,7 +162,7 @@ proc newLlmClient*(config: GameConfig): LlmClient =
   else:
     result.transport = ltNone
     result.disabled = true
-    echo "escrow llm: no LLM credentials; using scripted fallback"
+    echo "escrow llm: no LLM credentials; prompt seats cannot decide without a model transport"
 
 # ---- Scripted baselines -----------------------------------------------------
 
@@ -611,50 +595,60 @@ proc userPrompt*(sim: Sim, seat: int, prompt: string): string =
 
 # ---- Anthropic / Bedrock transport ------------------------------------------
 
-proc firstJsonObject*(text: string): string =
-  ## The FIRST balanced top-level `{...}` in `text`, or "" when there is
-  ## none. Braces inside JSON strings (and escaped quotes) are skipped, so
-  ## a contract body full of newlines cannot confuse the scan.
-  let start = text.find('{')
-  if start < 0:
-    return ""
-  var depth = 0
-  var inString = false
-  var escaped = false
-  for index in start .. text.high:
-    let c = text[index]
-    if inString:
-      if escaped: escaped = false
-      elif c == '\\': escaped = true
-      elif c == '"': inString = false
-      continue
-    case c
-    of '"': inString = true
-    of '{': inc depth
-    of '}':
-      dec depth
-      if depth == 0:
-        return text[start .. index]
-    else: discard
-  ""
+proc unwrapSingleJsonFence(text: string): tuple[ok: bool, body: string] =
+  ## Accepts either bare text or a single ordinary outer Markdown code fence
+  ## (``` or ```json, case-insensitive). Rejects other fence tags, unclosed
+  ## fences, or any text outside the fence.
+  let trimmed = text.strip()
+  if not trimmed.startsWith("```"):
+    return (true, trimmed)
+  let firstNewline = trimmed.find('\n')
+  if firstNewline < 0:
+    return (false, "")
+  let tag = trimmed[3 ..< firstNewline].strip().toLowerAscii()
+  if tag.len > 0 and tag != "json":
+    return (false, "")
+  if not trimmed.endsWith("```"):
+    return (false, "")
+  let innerEnd = trimmed.len - 3
+  if innerEnd <= firstNewline:
+    return (false, "")
+  var lineStart = innerEnd - 1
+  while lineStart > firstNewline and trimmed[lineStart] in {' ', '\t'}:
+    dec lineStart
+  if trimmed[lineStart] != '\n':
+    return (false, "")
+  (true, trimmed[firstNewline + 1 ..< lineStart].strip())
+
+proc replyPreview(text: string): string =
+  var head = text.strip()
+  if head.runeLen > 160:
+    head = head.runeSubStr(0, 160) & "..."
+  head.replace("\n", " ")
+
+proc extractJsonObjectText*(text: string): string =
+  ## Extracts the single JSON object text from a bare reply or a single
+  ## ordinary outer Markdown code fence (```json or ```). Rejects surrounding
+  ## prose, extra objects, or non-object JSON.
+  let unwrapped = unwrapSingleJsonFence(text)
+  if not unwrapped.ok or unwrapped.body.len == 0 or
+      unwrapped.body[0] != '{' or unwrapped.body[^1] != '}':
+    raise newException(EscrowError,
+      "expected a single JSON object: " & replyPreview(text))
+  unwrapped.body
 
 proc extractJsonObject*(text: string): JsonNode =
-  ## Pulls the first {...} object out of a model response, tolerating
-  ## fences, a preamble, and ANYTHING after the object — trailing prose or
-  ## a second object is simply ignored. (Taking everything up to the last
-  ## `}` instead made a chatty reply fail with "EOF expected", which cost
-  ## six of round 9's 35 rejected replies.) A reply with no complete
-  ## object in it is still an error.
-  let body = firstJsonObject(text)
-  if body.len == 0:
-    ## Quote the head of the reply so a hosted log shows WHAT the model
-    ## sent instead of JSON (prose, a refusal, a cut-off analysis...).
-    var head = text.strip()
-    if head.runeLen > 160:
-      head = head.runeSubStr(0, 160) & "..."
-    raise newException(EscrowError, "no JSON object in response: " &
-      head.replace("\n", " "))
-  parseJson(body)
+  ## Parses exactly one JSON object from `text`, bare or inside a single
+  ## ordinary outer Markdown code fence (```json or ```). Rejects surrounding
+  ## prose, extra objects, or non-object JSON.
+  let body = extractJsonObjectText(text)
+  try:
+    result = parseJson(body)
+  except JsonParsingError as error:
+    raise newException(EscrowError, "invalid JSON object: " & error.msg)
+  if result.kind != JObject:
+    raise newException(EscrowError,
+      "expected a single JSON object: " & replyPreview(text))
 
 proc requestFor(client: LlmClient, system, user: string, slot: int):
     tuple[url: string, headers: HttpHeaders, body: string] =
@@ -690,35 +684,33 @@ proc requestFor(client: LlmClient, system, user: string, slot: int):
 
 proc textOf(client: LlmClient, response: Response, error, url: string):
     string =
-  ## The text of one batched reply, or an EscrowError describing why there
-  ## is none. Auth failures disable the client; model-access and throttle
-  ## failures rotate the Bedrock model for the next batch.
+  ## The text of one batched reply, or an LlmInfraError describing why there
+  ## is none. Auth failures disable the client; no alternate-model fallback.
   if error.len > 0:
-    raise newException(EscrowError, "llm transport: " & error)
+    raise newException(LlmInfraError, "llm transport: " & error)
   if response.code == 401 or response.code == 403:
     let detail = response.body[0 .. min(response.body.high, 400)]
-    if "Model access is denied" in response.body and
-        client.tryNextBedrockModel("no model access"):
-      raise newException(EscrowError,
-        "bedrock model access denied: " & detail)
     client.disabled = true
-    raise newException(EscrowError,
+    raise newException(LlmInfraError,
       "llm auth failed (" & $response.code & ") at " & url & ": " & detail)
   if response.code == 429:
     let detail = response.body[0 .. min(response.body.high, 300)]
-    discard client.tryNextBedrockModel("throttled")
-    raise newException(EscrowError, "llm throttled (429): " & detail)
+    raise newException(LlmInfraError, "llm throttled (429): " & detail)
   if response.code < 200 or response.code >= 300:
-    raise newException(EscrowError, "anthropic error " & $response.code &
+    raise newException(LlmInfraError, "anthropic error " & $response.code &
       ": " & response.body[0 .. min(response.body.high, 300)])
-  let payload = parseJson(response.body)
+  let payload =
+    try:
+      parseJson(response.body)
+    except JsonParsingError as parseErr:
+      raise newException(LlmInfraError, "invalid provider JSON: " & parseErr.msg)
   if payload{"stop_reason"}.getStr() == "refusal":
-    raise newException(EscrowError, "anthropic refusal")
+    raise newException(LlmInfraError, "anthropic refusal")
   for contentBlock in payload["content"]:
     if contentBlock{"type"}.getStr() == "text":
       result.add(contentBlock{"text"}.getStr())
   if payload{"stop_reason"}.getStr() == "max_tokens" and '{' notin result:
-    raise newException(EscrowError, "reply cut off at max_tokens before " &
+    raise newException(LlmInfraError, "reply cut off at max_tokens before " &
       "any JSON: " & result[0 .. min(result.high, 160)].replace("\n", " "))
 
 # ---- Reply parsing ----------------------------------------------------------
@@ -732,61 +724,83 @@ proc cleanText*(text: string, limit: int): string =
     return
   result = result.runeSubStr(0, limit - 1) & "…"
 
-proc wholeNumber(node: JsonNode, what: string): int =
-  ## An integer, a numeric string, or a float (rounded).
-  if node.isNil:
-    raise newException(EscrowError, what & " is missing")
-  case node.kind
-  of JInt:
-    node.getInt()
-  of JFloat:
-    int(round(node.getFloat()))
-  of JString:
-    let text = node.getStr().strip()
-    try:
-      int(round(parseFloat(text)))
-    except ValueError:
-      raise newException(EscrowError, what & " is not a number: " & text)
-  else:
-    raise newException(EscrowError, what & " must be a number: " & $node)
-
 proc parseDecision*(payload: JsonNode, sim: Sim, seat: int): Decision =
-  ## Tolerant by design: missing fields mean "no action" and `{}` is a
-  ## legal reply meaning "pass". A MALFORMED entry, though, invalidates the
-  ## whole reply so the retry can quote the exact problem.
-  result.notes = cleanText(payload{"notes"}.getStr(), MaxNotesLen)
-  result.say = cleanText(payload{"say"}.getStr().replace("\n", " "), MaxSayLen)
-  if not sim.config.talk:
-    result.say = ""
-  result.offer = clip(payload{"offer"}.getStr(), MaxOfferChars)
-  let signs = payload{"sign"}
-  if not signs.isNil and signs.kind == JArray:
+  ## Missing optional fields mean "no action" and `{}` is a legal reply
+  ## meaning "pass". Unknown fields, wrong types, non-integer counts, or
+  ## over-cap actions are rejected instead of silently coerced or dropped.
+  if payload.isNil or payload.kind != JObject:
+    raise newException(EscrowError, "reply must be a JSON object")
+  for key in payload.keys:
+    if key notin ["give", "offer", "sign", "say", "notes"]:
+      raise newException(EscrowError, "unknown action field: \"" & key & "\"")
+  if payload.hasKey("notes"):
+    let node = payload["notes"]
+    if node.kind != JString:
+      raise newException(EscrowError, "notes must be a string")
+    result.notes = cleanText(node.getStr(), MaxNotesLen)
+  if payload.hasKey("say"):
+    let node = payload["say"]
+    if node.kind != JString:
+      raise newException(EscrowError, "say must be a string")
+    if not sim.config.talk:
+      if node.getStr().strip().len > 0:
+        raise newException(EscrowError, "talk is disabled in this game")
+    else:
+      result.say = cleanText(node.getStr().replace("\n", " "), MaxSayLen)
+  if payload.hasKey("offer"):
+    let node = payload["offer"]
+    if node.kind != JString:
+      raise newException(EscrowError, "offer must be a string")
+    let raw = node.getStr().strip()
+    if raw.runeLen > MaxOfferChars:
+      raise newException(EscrowError,
+        "offer is at most " & $MaxOfferChars & " characters")
+    result.offer = raw
+  if payload.hasKey("sign"):
+    let signs = payload["sign"]
+    if signs.kind != JArray:
+      raise newException(EscrowError, "sign must be a JSON array")
+    if signs.len > MaxSigns:
+      raise newException(EscrowError,
+        "at most " & $MaxSigns & " signings per turn")
     for entry in signs:
-      if result.signs.len >= MaxSigns:
-        break   ## entries past the cap are dropped, not fatal
       if entry.kind != JString:
         raise newException(EscrowError, "each sign entry is a contract id")
-      result.signs.add(entry.getStr().strip().toUpperAscii())
-  let gives = payload{"give"}
-  if not gives.isNil and gives.kind == JArray:
+      let id = entry.getStr().strip().toUpperAscii()
+      if id.len == 0:
+        raise newException(EscrowError, "each sign entry is a contract id")
+      result.signs.add(id)
+  if payload.hasKey("give"):
+    let gives = payload["give"]
+    if gives.kind != JArray:
+      raise newException(EscrowError, "give must be a JSON array")
+    if gives.len > MaxGives:
+      raise newException(EscrowError,
+        "at most " & $MaxGives & " gives per turn")
     for entry in gives:
-      if result.gives.len >= MaxGives:
-        break   ## entries past the cap are dropped, not fatal
       if entry.kind != JObject:
         raise newException(EscrowError, "each give is {to, n, good}")
+      for key in entry.keys:
+        if key notin ["to", "n", "good"]:
+          raise newException(EscrowError,
+            "unknown give field: \"" & key & "\"")
       var order: GiveOrder
       let to = entry{"to"}
-      if to.isNil:
+      if to.isNil or to.kind notin {JInt, JString}:
         raise newException(EscrowError, "a give needs a \"to\" cog")
       order.to =
         if to.kind == JInt: to.getInt()
         else: sim.seatOfName(to.getStr())
       if order.to < 0 or order.to >= Seats:
         raise newException(EscrowError,
-          "\"" & to.getStr() & "\" is not a cog at this table")
+          "\"" & (if to.kind == JString: to.getStr() else: $to) &
+          "\" is not a cog at this table")
       if order.to == seat:
         raise newException(EscrowError, "you cannot give to yourself")
-      order.n = wholeNumber(entry{"n"}, "a give's n")
+      let nNode = entry{"n"}
+      if nNode.isNil or nNode.kind != JInt:
+        raise newException(EscrowError, "a give's n must be an integer")
+      order.n = nNode.getInt()
       if order.n < 1 or order.n > MaxUnits:
         raise newException(EscrowError,
           "a give is 1.." & $MaxUnits & " units, got " & $order.n)
@@ -818,19 +832,28 @@ proc decideAll*(
   captures: seq[CapturedDecision] = @[]
 ): seq[SeatDecision] =
   ## One decision per seat in `seats`, in order, each tagged with whether
-  ## the scripted baseline produced it. Never raises: any failure falls
-  ## back to the scripted `trader` baseline so the episode always
-  ## advances. `prompts` and `scripted` are indexed by SEAT.
+  ## a genuine scripted policy produced it or whether decision-making failed.
+  ## Rejected or unavailable model turns are never substituted with a scripted
+  ## bot or an empty pass; callers terminate the unfinished episode unscored.
+  ## `prompts` and `scripted` are indexed by SEAT.
   result = newSeq[SeatDecision](seats.len)
   var open: seq[int]     ## indexes into `seats` still undecided
   var hints = newSeq[string](seats.len)
+  var failureKinds = newSeq[DecisionFailureKind](seats.len)
+  var failureReasons = newSeq[string](seats.len)
   for index, seat in seats:
     let kind = scripted[seat]
-    if kind != skNone or client.disabled:
+    if kind != skNone:
       result[index] = SeatDecision(
-        move: scriptedAction(sim, seat,
-          (if kind == skNone: skTrader else: kind)),
+        move: scriptedAction(sim, seat, kind),
         scripted: true)
+    elif client.disabled:
+      result[index] = SeatDecision(
+        move: Move(),
+        scripted: false,
+        failed: true,
+        failureKind: dfInfra,
+        failureReason: "no LLM credentials configured")
     else:
       open.add(index)
   for attempt in 0 .. 1:
@@ -865,7 +888,12 @@ proc decideAll*(
       try:
         let text = client.textOf(responses[position].response,
           responses[position].error, batch[position].url)
-        if capture != nil: capture.replyText(text, firstJsonObject(text))
+        var jsonText = ""
+        try:
+          jsonText = extractJsonObjectText(text)
+        except CatchableError:
+          discard
+        if capture != nil: capture.replyText(text, jsonText)
         let decision = parseDecision(extractJsonObject(text), sim, seat)
         ## Reject illegal replies here so the retry carries the hint. The
         ## strict validator walks the sim's own resolution order on a copy
@@ -874,15 +902,34 @@ proc decideAll*(
         if problem.len > 0:
           raise newException(EscrowError, problem)
         result[index] = SeatDecision(move: decision, scripted: false)
+      except LlmInfraError as error:
+        if capture != nil: capture.rejectedAttempt(error.msg)
+        echo "escrow llm: seat ", seat, " attempt ", attempt, " infra failure: ",
+          error.msg
+        hints[index] = cleanText(error.msg, 300)
+        failureKinds[index] = dfInfra
+        failureReasons[index] = error.msg
+        stillOpen.add(index)
       except CatchableError as error:
         if capture != nil: capture.rejectedAttempt(error.msg)
         echo "escrow llm: seat ", seat, " attempt ", attempt, " failed: ",
           error.msg
         hints[index] = cleanText(error.msg, 300)
+        failureKinds[index] = dfRejected
+        failureReasons[index] = error.msg
         stillOpen.add(index)
     open = stillOpen
   for index in open:
     let seat = seats[index]
-    echo "escrow llm: seat ", seat, " falling back to the trader baseline"
+    let kind = if failureKinds[index] != dfNone: failureKinds[index] else: dfInfra
+    let reason = if failureReasons[index].len > 0: failureReasons[index]
+      elif client.disabled: "llm transport disabled"
+      else: "decision failed"
+    echo "escrow llm: seat ", seat, " failed after retries (", $kind, ": ",
+      reason, "); no substitute action"
     result[index] = SeatDecision(
-      move: scriptedAction(sim, seat, skTrader), scripted: true)
+      move: Move(),
+      scripted: false,
+      failed: true,
+      failureKind: kind,
+      failureReason: reason)
