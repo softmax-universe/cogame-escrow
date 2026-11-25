@@ -46,9 +46,9 @@ Eligibility requires a complete joined successful response and exact equality of
 (`give`, `offer`, `sign`), type, and value against the native installed command. Presentation and ancillary free-text
 fields (`notes`, `say`) may legitimately be clipped or normalized to the game's display/memory bounds without marking
 a valid truthful native move rejected; raw text is preserved verbatim in attempt evidence while `native_execution`
-documents `notes_clipped`, `say_clipped`, `notes_after`, `installed_action`, and `typed_action_projection`. The native
-reply extractor accepts exactly one JSON object, bare or inside a single ordinary outer Markdown code fence (`json` or
-plain), and rejects surrounding prose or extra objects; omitted optional fields remain eligible. Duplicate keys,
+documents `notes_clipped`, `say_clipped`, `notes_after`, `installed_action`, and `typed_action_projection`. The native reply extractor accepts a single bare JSON object or one complete final plain or `json` Markdown fenced JSON
+object following an optional explanation, and rejects trailing text, extra objects or fences, non-JSON fences, or
+unclosed documents; omitted optional fields remain eligible. Duplicate keys,
 non-JSON syntax, non-finite numbers, excessive nesting, and actionable field normalization are excluded from targets
 without changing the raw completion.
 Recipient integers are compared to the installed numeric seat; recipient strings must exactly equal that seat's frozen

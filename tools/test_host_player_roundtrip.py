@@ -191,34 +191,65 @@ def start_mock_llm(handler_fn):
 
 
 def test_regular_json_fence_and_clipped_notes(base: Path) -> None:
-    """Case 1: Regular JSON, ```json fence, and >600-char notes with omitted offer/give."""
+    """Case 1: Reasoning before final fenced real offer & sign, bare JSON, and >600-char notes."""
     long_notes = (
         "Turn planning with detailed arithmetic: "
         + "holding surplus ore for commission conversion; " * 25
     )
     assert len(long_notes) > 600
+    posted_offers = []
+    signed_ids = []
 
     def responder(slot, body, calls):
         user = body["messages"][0]["content"]
         m = re.search(r"^Turn (\d+) of (\d+)", user)
         turn = int(m.group(1))
+        floor = user.split("THE FLOOR:\n", 1)[1].split("THE ESCROW BOARD:", 1)[0]
+        aliases = [
+            line.split("|")[0].strip()
+            for line in floor.splitlines()
+            if "|" in line and not line.startswith("cog")
+        ]
+        target = aliases[(slot + 1) % 4]
         signable = user.split("SIGNABLE NOW", 1)[1].split("YOUR OPEN OFFERS", 1)[0]
         affordable = re.findall(r"^\s+(C\d+) from .*— AFFORDABLE$", signable, re.MULTILINE)
         if turn == 0:
-            # Bare regular JSON with real model action (say + notes)
-            return 200, json.dumps({"say": f"bare-json-turn-{turn}", "notes": "short note"})
-        if turn == 1:
-            # ```json fenced object with >600-char notes and omitted optional offer/give
+            # Natural-language reasoning before a final ```json fenced real offer (upload.log pattern)
+            offer = (
+                f"OFFER {target}\nLOCK 1 HEARTS\nASK 1 ORE\nDUE {turn + 1}\n"
+                "IF ALWAYS\nTHEN SWAP\nELSE KEEP"
+            )
+            posted_offers.append(offer)
             action = {
-                "sign": affordable[:2],
+                "offer": offer,
+                "say": "1 heart for 1 ore",
+                "notes": "turn 0 plan",
+            }
+            return (
+                200,
+                "I need to analyze this turn and plan my strategy.\n\n"
+                "**Current Situation:**\n- Posting a funded offer for turn 1.\n\n"
+                "```json\n" + json.dumps(action) + "\n```",
+            )
+        if turn == 1:
+            # Reasoning before a final plain ``` fenced sign + >600-char notes (optional offer/give omitted)
+            chosen = affordable[:2]
+            signed_ids.extend(chosen)
+            action = {
+                "sign": chosen,
                 "say": "fenced-long-notes-turn-1",
                 "notes": long_notes,
             }
-            return 200, "```json\n" + json.dumps(action) + "\n```"
+            return (
+                200,
+                "Evaluating SIGNABLE NOW offers for turn 1.\n```\n"
+                + json.dumps(action)
+                + "\n```",
+            )
         if turn == 2:
-            # Plain ``` fence with optional fields omitted
-            return 200, "```\n" + json.dumps({"sign": affordable[:1], "notes": long_notes}) + "\n```"
-        return 200, json.dumps({"sign": affordable[:2], "say": "closing"})
+            # Bare regular JSON preserved
+            return 200, json.dumps({"sign": affordable[:1], "say": "bare-json-turn-2"})
+        return 200, "```json\n" + json.dumps({"sign": affordable[:2], "say": "closing"}) + "\n```"
 
     server, endpoint, calls = start_mock_llm(responder)
     try:
@@ -245,7 +276,8 @@ def test_regular_json_fence_and_clipped_notes(base: Path) -> None:
         assert len(results["scores"]) == 4 and all(isinstance(s, int) for s in results["scores"])
         assert len(calls) == 4, f"expected 4 model calls for seat 0, got {len(calls)}"
 
-        # Check native trajectory: all 4 seat-0 model decisions accepted, including clipped notes!
+        # Check native trajectory: all 4 seat-0 model decisions accepted, including
+        # reasoning-before-fenced-offer (turn 0), reasoning-before-plain-fenced-sign (turn 1), and bare JSON (turn 2)!
         rows = [json.loads(l) for l in (work / "trajectory.jsonl").read_text().splitlines()]
         seat0_rows = [r for r in rows if r["event_type"] == "decision" and r["seat"] == "0"]
         assert len(seat0_rows) == 4
@@ -254,16 +286,26 @@ def test_regular_json_fence_and_clipped_notes(base: Path) -> None:
                 f"turn {idx} rejected: {row['attempts'][-1].get('rejection_reason')}"
             )
             assert row["selected_attempt_id"] is not None
-        # Verify raw text preserved & notes_clipped documented on turn 1
+        # Turn 0: reasoning before final ```json fenced real offer
+        t0 = seat0_rows[0]
+        assert "I need to analyze this turn" in t0["attempts"][-1]["response"]
+        assert t0["executed_action"]["offer"] == posted_offers[0]
+        assert any(
+            ev["kind"] == "offer" and ev["seat"] == 0
+            for ev in t0["observation"]["native_execution"]["events"]
+        )
+        # Turn 1: reasoning before final plain ``` fenced sign + clipped notes
         t1 = seat0_rows[1]
+        assert "Evaluating SIGNABLE NOW" in t1["attempts"][-1]["response"]
         assert long_notes in t1["attempts"][-1]["response"]
+        assert t1["executed_action"]["sign"] == signed_ids
         assert len(t1["executed_action"]["notes"]) == 600
         assert t1["executed_action"]["notes"].endswith("…")
         assert t1["executed_action"]["offer"] == ""
         assert t1["executed_action"]["give"] == []
         assert t1["observation"]["native_execution"]["notes_clipped"] is True
         assert rows[-1]["status"] == "completed"
-        print("PASS case 1: regular JSON, ```json/plain fences, clipped notes + optional defaults")
+        print("PASS case 1: reasoning before final fenced offer/sign, bare JSON, clipped notes + capture admission")
     finally:
         server.shutdown()
 
@@ -287,44 +329,54 @@ def assert_canonical_player_failure(
 
 
 def test_invalid_ambiguous_object_fails_unscored(base: Path) -> None:
-    """Case 2: Invalid/ambiguous object (two JSON objects / prose) fails in one model turn."""
-    def responder(slot, body, calls):
-        return 200, '{"say": "first"} {"say": "second"}'
+    """Case 2: Ambiguous two-document, trailing-text, and unclosed action replies fail in one turn."""
+    bad_cases = [
+        ("two-bare-objects", '{"say": "first"} {"say": "second"}'),
+        (
+            "two-fenced-documents",
+            'First thought:\n```json\n{"say": "first"}\n```\nActually:\n```json\n{"say": "second"}\n```',
+        ),
+        ("unclosed-fence", 'Planning my turn.\n```json\n{"say": "cut off"}'),
+        ("trailing-after-fence", 'Planning my turn.\n```json\n{"say": "ok"}\n```\nDone.'),
+    ]
+    for label, reply_text in bad_cases:
+        def responder(slot, body, calls, text=reply_text):
+            return 200, text
 
-    server, endpoint, calls = start_mock_llm(responder)
-    try:
-        work = base / "invalid-ambiguous"
-        work.mkdir()
-        rc, _ = run_episode(
-            work,
-            turns=4,
-            seed=11,
-            player_envs=[
-                {"COWORLD_LLM_ENABLED": "true"},
-                {"PLAYER_SCRIPTED": "trader"},
-                {"PLAYER_SCRIPTED": "trader"},
-                {"PLAYER_SCRIPTED": "hoarder"},
-            ],
-            llm_endpoint=endpoint,
-            capture=True,
-        )
-        assert rc != 0, "ambiguous object must fail episode"
-        assert len(calls) == 1, f"expected 1 model turn (no retry loop), got {len(calls)}"
-        assert not (work / "results.json").exists(), "must not write numeric results on failure"
-        failure = json.loads((work / "player_failure.json").read_text())
-        assert_canonical_player_failure(failure, expected_slot=0, expected_kind="player_error")
-        rows = [json.loads(l) for l in (work / "trajectory.jsonl").read_text().splitlines()]
-        assert rows[-1]["status"] == "failed"
-        assert rows[-1]["participant_outcomes"] is None
-        outcome = rows[-1]["outcome"]
-        assert outcome["status"] == "failed"
-        assert outcome["failureKind"] == "rejected"
-        assert outcome["seat"] == 0
-        assert outcome["turn"] == 0
-        assert outcome["error"]
-        print("PASS case 2: invalid/ambiguous JSON object fails in 1 turn with canonical GamePlayerFailure + private diagnostics")
-    finally:
-        server.shutdown()
+        server, endpoint, calls = start_mock_llm(responder)
+        try:
+            work = base / f"invalid-{label}"
+            work.mkdir()
+            rc, _ = run_episode(
+                work,
+                turns=4,
+                seed=11,
+                player_envs=[
+                    {"COWORLD_LLM_ENABLED": "true"},
+                    {"PLAYER_SCRIPTED": "trader"},
+                    {"PLAYER_SCRIPTED": "trader"},
+                    {"PLAYER_SCRIPTED": "hoarder"},
+                ],
+                llm_endpoint=endpoint,
+                capture=True,
+            )
+            assert rc != 0, f"{label} must fail episode"
+            assert len(calls) == 1, f"{label}: expected 1 model turn (no retry loop), got {len(calls)}"
+            assert not (work / "results.json").exists(), f"{label}: must not write numeric results on failure"
+            failure = json.loads((work / "player_failure.json").read_text())
+            assert_canonical_player_failure(failure, expected_slot=0, expected_kind="player_error")
+            rows = [json.loads(l) for l in (work / "trajectory.jsonl").read_text().splitlines()]
+            assert rows[-1]["status"] == "failed"
+            assert rows[-1]["participant_outcomes"] is None
+            outcome = rows[-1]["outcome"]
+            assert outcome["status"] == "failed"
+            assert outcome["failureKind"] == "rejected"
+            assert outcome["seat"] == 0
+            assert outcome["turn"] == 0
+            assert outcome["error"]
+        finally:
+            server.shutdown()
+    print("PASS case 2: two-document, trailing-text, and unclosed action replies fail in 1 turn with canonical GamePlayerFailure + private diagnostics")
 
 
 def test_unfunded_offer_first_rejection_single_turn(base: Path) -> None:
