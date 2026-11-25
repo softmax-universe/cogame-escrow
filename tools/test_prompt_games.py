@@ -89,7 +89,7 @@ def play(variant, seed, wording="canonical", prompt_seed=0, private=False):
                 teacher["give"] = [
                     {
                         "to": view["public_floor"][(seat + 1) % 4]["name"],
-                        "n": "1.0",
+                        "n": 1,
                         "good": " hearts ",
                     }
                 ]

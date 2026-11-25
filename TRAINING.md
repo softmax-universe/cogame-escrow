@@ -43,9 +43,10 @@ change the existing replay format or its notes visibility. The ordinary player v
 seats' notes.
 
 Eligibility requires a complete joined successful response and exact equality of every supplied JSON field, type, and
-value against the native installed command. The original first-balanced-object extractor still accepts fences and
-trailing prose; omitted defaults remain eligible. Duplicate keys, non-JSON syntax, non-finite numbers, excessive
-nesting, and native normalization are excluded from targets without changing the production parser or raw completion.
+value against the native installed command. The native reply extractor accepts exactly one JSON object, bare or inside
+a single ordinary outer Markdown code fence (`json` or plain), and rejects surrounding prose or extra objects; omitted
+optional fields remain eligible. Duplicate keys, non-JSON syntax, non-finite numbers, excessive
+nesting, and native normalization are excluded from targets without changing the raw completion.
 Recipient integers are compared to the installed numeric seat; recipient strings must exactly equal that seat's frozen
 alias. Case and whitespace repairs are excluded. The numeric installed action and typed comparison projection are both
 recorded; the completion is never rewritten. Failed, scripted, fallback, or incomplete attempts do not become model

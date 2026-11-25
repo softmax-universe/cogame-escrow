@@ -347,7 +347,7 @@ def check_capture(output, calls, mode):
             and int(row["decision_id"].split("-")[0]) <= 4
         )
     if mode == "errors":
-        assert statuses["fallback"] and rows[-1]["status"] == "failed"
+        assert statuses["rejected"] and rows[-1]["status"] == "failed"
         assert "private capture publication failed" in (output / "game.log").read_text()
     else:
         assert rows[-1]["status"] == "completed"

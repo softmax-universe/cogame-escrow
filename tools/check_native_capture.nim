@@ -98,8 +98,8 @@ while index < rows.len:
           doAssert attempt["rejection_reason"].getStr() == error.msg
       if attempt["rejection_reason"].kind == JString:
         previousError = attempt["rejection_reason"].getStr()
-    scripted[seat] = not parsed
-    if not parsed: moves[seat] = scriptedAction(game, seat, skTrader)
+    scripted[seat] = false
+    if not parsed: moves[seat] = Move()
   # All requests and proposals above use exactly the same pre-application native state.
   for seat in 0 ..< Seats: game.applyMove(seat, moves[seat], scripted[seat])
   var events = newJArray()

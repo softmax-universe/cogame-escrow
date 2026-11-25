@@ -399,7 +399,7 @@ proc recordApplied(capture: RuntimeCapture, decision: CapturedDecision,
     var strict = false
     if decision.attempts.len > 0:
       try:
-        # generated stores the exact substring from native firstJsonObject, never a repaired label.
+        # generated stores the exact substring from native extractJsonObjectText, never a repaired label.
         raw = strictRawObject(decision.generated[^1])
         strict = true
       except CatchableError: discard
@@ -421,22 +421,22 @@ proc recordApplied(capture: RuntimeCapture, decision: CapturedDecision,
       "post_native_sha256": nativeStateHash(sim)}
     var selected = none(string)
     var status = asMissing
-    if move.scripted and decision.policy == "prompt": status = asFallback
-    elif not move.scripted and decision.policy == "prompt":
-      status = asRejected
+    if not move.scripted and decision.policy == "prompt":
       if decision.attempts.len > 0:
+        status = asRejected
         var evidence = addr decision.attempts[^1]
-        evidence.parsedAction = copy(actual)
-        evidence.accepted = not decision.failed and evidence.rejectionReason.isNone and
-          evidence.responseComplete == some(true) and evidence.responseReaderJoined == some(true) and
-          evidence.httpStatus.isSome and evidence.httpStatus.get() in 200 .. 299 and
-          evidence.rawResponse.kind == JString and evidence.responseBodyB64.isSome and
-          evidence.responseHeaders.isSome and strict and equalSupplied(raw, actual)
-        if evidence.accepted:
-          selected = some(evidence.attemptId)
-          status = asAccepted
-        else:
-          evidence.rejectionReason = some("strict JSON grammar/depth or supplied field/type/value differs from installed command")
+        if evidence.rejectionReason.isNone:
+          evidence.parsedAction = copy(actual)
+          evidence.accepted = not decision.failed and
+            evidence.responseComplete == some(true) and evidence.responseReaderJoined == some(true) and
+            evidence.httpStatus.isSome and evidence.httpStatus.get() in 200 .. 299 and
+            evidence.rawResponse.kind == JString and evidence.responseBodyB64.isSome and
+            evidence.responseHeaders.isSome and strict and equalSupplied(raw, actual)
+          if evidence.accepted:
+            selected = some(evidence.attemptId)
+            status = asAccepted
+          else:
+            evidence.rejectionReason = some("strict JSON grammar/depth or supplied field/type/value differs from installed command")
     var originalAttempts = newJArray()
     for evidence in decision.attempts: originalAttempts.add(attemptEvidenceJson(evidence))
     let original = %*{"observation": decision.observation, "attempts": originalAttempts,

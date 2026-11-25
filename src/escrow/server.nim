@@ -25,7 +25,7 @@
 ##                             "observation":{...seat state...}}
 ##   external player -> game: {"type":"action","id":N,"action":{...}}
 ##                   (max 4000 chars; scripted plays a built-in baseline
-##                   for that seat: "trader" / "1", or "hoarder")
+##                   for that seat: "trader" or "hoarder")
 
 import
   std/[json, locks, os, sets, strutils, tables, times, unicode],
@@ -316,6 +316,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       var decisionId: int
       var scripted: seq[ScriptKind]
       var captures: seq[CapturedDecision]
+      var llmSeats: seq[int]
       withLock stateLock:
         if state.sim.done:
           break
@@ -348,19 +349,28 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
                 state.playerStateJson(seat), state.selection.selectionMetadata(), preHash)
           except CatchableError as error: state.capture.captureError(error.msg)
         for seat in seats:
-          if external[seat] and state.playerSockets.hasKey(seat):
-            state.playerSockets[seat].send($ %*{
-              "type": "observation", "id": decisionId,
-              "observation": state.playerStateJson(seat)})
           if external[seat]:
-            scripted[seat] = skTrader
+            if state.playerSockets.hasKey(seat):
+              state.playerSockets[seat].send($ %*{
+                "type": "observation", "id": decisionId,
+                "observation": state.playerStateJson(seat)})
+          else:
+            llmSeats.add(seat)
         echo "escrow: turn ", state.sim.turn, " of ", config.turns,
           " at ", (epochTime() - gameStart).int, "s"
 
       ## Model requests (ONE parallel batch for the turn) run
       ## outside the lock on a snapshot; only this thread mutates the sim,
       ## so the snapshot cannot go stale.
-      var decisions = client.decideAll(simCopy, seats, prompts, scripted, state.selection, captures)
+      let llmDecisions = client.decideAll(simCopy, llmSeats, prompts, scripted, state.selection, captures)
+      var decisions = newSeq[SeatDecision](seats.len)
+      var llmIndex = 0
+      for index, seat in seats:
+        if external[seat]:
+          decisions[index] = SeatDecision(move: Move(), scripted: false)
+        else:
+          decisions[index] = llmDecisions[llmIndex]
+          inc llmIndex
       let deadline = epochTime() + config.llmTimeoutSeconds.float
       while epochTime() < deadline:
         var ready = true
@@ -382,9 +392,6 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         let beforeEvents = if state.capture != nil: state.sim.events.len else: 0
         for index, seat in seats:
           let decision = decisions[index].move
-          ## Not the registration state: `decideAll` reports the baseline
-          ## it actually played, including a seat whose LLM attempts both
-          ## failed, so the replay's `scripted` flag counts every fallback.
           let wasScripted = decisions[index].scripted
           echo "escrow: turn ", state.sim.turn, " ", state.sim.names[seat],
             " (", state.sim.profileName(seat), ") gives ",
@@ -397,9 +404,8 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
             state.sim.applyMove(seat, decision, wasScripted)
           except EscrowError as error:
             echo "escrow: reply rejected (", error.msg,
-              "); using the trader baseline"
-            let fallback = scriptedAction(state.sim, seat, skTrader)
-            state.sim.applyMove(seat, fallback, true)
+              "); forfeiting turn as pass"
+            state.sim.applyMove(seat, Move(), false)
         if state.capture != nil:
           try:
             state.capture.appliedTurn(captures, simCopy.turn, state.sim,
@@ -540,9 +546,9 @@ proc websocketHandler(
           return
         if payload{"type"}.getStr() == "action":
           withLock stateLock:
-            if state.external[slot] and payload["id"].getInt() ==
+            if state.external[slot] and payload{"id"}.getInt(-1) ==
                 state.decisionId and state.pendingActions[slot].isNil:
-              let action = payload["action"]
+              let action = payload{"action"}
               let move = parseDecision(action, state.sim, slot)
               let problem = state.sim.validateMove(slot, move)
               if problem.len > 0:
@@ -556,9 +562,8 @@ proc websocketHandler(
           let node = payload{"scripted"}
           let scripted =
             if node.isNil: skNone
-            elif node.kind == JBool: (if node.getBool(): skTrader
-              else: skNone)
-            else: parseScriptKind(node.getStr())
+            elif node.kind == JString: parseScriptKind(node.getStr())
+            else: raise newException(EscrowError, "scripted must be a string")
           withLock stateLock:
             state.prompts[slot] = prompt
             state.external[slot] = false
@@ -568,6 +573,10 @@ proc websocketHandler(
             (if scripted != skNone: ", scripted " & $scripted else: ""), ")"
       except CatchableError as error:
         echo "escrow: ignoring bad player frame: ", error.msg
+        try:
+          websocket.send($ %*{"type": "error", "error": error.msg})
+        except CatchableError:
+          discard
     of ErrorEvent:
       discard
     of CloseEvent:

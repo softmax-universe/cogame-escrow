@@ -177,40 +177,52 @@ suite "scripted baselines":
         signedAny += traded.seats[seat].signedCount
       check signedAny > 0
 
-  test "15. decideAll falls back to scripted with no credentials, instantly":
+  test "15. decideAll passes prompt seats with no credentials while keeping genuine scripted seats":
     let config = fixture(3, turns = 8)
+    let saved = [
+      ("COWORLD_LLM_ENDPOINT", getEnv("COWORLD_LLM_ENDPOINT")),
+      ("AWS_ENDPOINT_URL_BEDROCK_RUNTIME", getEnv("AWS_ENDPOINT_URL_BEDROCK_RUNTIME")),
+      ("AWS_BEARER_TOKEN_BEDROCK", getEnv("AWS_BEARER_TOKEN_BEDROCK")),
+      ("ANTHROPIC_API_KEY", getEnv("ANTHROPIC_API_KEY")),
+      ("ANTHROPIC_API_KEY_URI", getEnv("ANTHROPIC_API_KEY_URI")),
+    ]
+    for (k, _) in saved: delEnv(k)
     let client = newLlmClient(config)
-    ## CI never sets ANTHROPIC_API_KEY: this is the path offline
-    ## certification and docker_smoke.sh take, and it is load-bearing.
+    for (k, v) in saved:
+      if v.len > 0: putEnv(k, v)
     check client.disabled
     var sim = initSim(config)
     let started = getMonoTime()
     while not sim.done:
       let seats = sim.pendingSeats()
       let decisions = client.decideAll(sim, seats,
-        @["be bold", "", "", ""], @[skNone, skNone, skHoarder, skNone], PromptSelection())
+        @["be bold", "", "", ""], @[skNone, skTrader, skHoarder, skNone], PromptSelection())
       check decisions.len == seats.len
       for index, seat in seats:
-        let kind = if seat == 2: skHoarder else: skTrader
-        let expected = scriptedAction(sim, seat, kind)
-        check decisions[index].scripted
-        check decisions[index].move.offer == expected.offer
-        check decisions[index].move.signs == expected.signs
-        check decisions[index].move.gives.len == expected.gives.len
+        if seat in [1, 2]:
+          let kind = if seat == 1: skTrader else: skHoarder
+          let expected = scriptedAction(sim, seat, kind)
+          check decisions[index].scripted
+          check decisions[index].move.offer == expected.offer
+          check decisions[index].move.signs == expected.signs
+          check decisions[index].move.gives.len == expected.gives.len
+        else:
+          check not decisions[index].scripted
+          check decisions[index].move == Move()
         sim.applyMove(seat, decisions[index].move, decisions[index].scripted)
     check sim.reason == "complete"
     check sim.turnsPlayed == 8
     ## No network waits at all.
     check (getMonoTime() - started).inMilliseconds < 2000
-    check parseScriptKind("1") == skTrader
     check parseScriptKind("trader") == skTrader
-    check parseScriptKind("TRUE") == skTrader
     check parseScriptKind("hoarder") == skHoarder
-    check parseScriptKind("autarky") == skHoarder
+    check parseScriptKind("1") == skNone
+    check parseScriptKind("TRUE") == skNone
+    check parseScriptKind("autarky") == skNone
     check parseScriptKind("") == skNone
     check parseScriptKind("basestock") == skNone
 
-  test "16. the reply-parsing table":
+  test "16. the strict reply-parsing table":
     var sim = initSim(fixture(5, turns = 12))
     let me = sim.seatOfProfile[pMason]
     let you = sim.names[sim.seatOfProfile[pFarmer]]
@@ -242,36 +254,53 @@ suite "scripted baselines":
     check pass.notes == ""
     check sim.validateMove(me, pass) == ""
 
-    ## `n` may be an integer, a numeric string or a float.
-    for raw in ["4", "\"4\"", "4.2", "\" 4 \""]:
-      let one = parseDecision(parseJson(
-        """{"give": [{"to": "%YOU%", "n": %N%, "good": "ore"}]}"""
-          .replace("%YOU%", you).replace("%N%", raw)), sim, me)
-      check one.gives[0].n == 4
+    ## `n` must be a strict integer; numeric strings and floats are rejected.
+    let validInt = parseDecision(parseJson(
+      """{"give": [{"to": "%YOU%", "n": 4, "good": "ORE"}]}"""
+        .replace("%YOU%", you)), sim, me)
+    check validInt.gives[0].n == 4
+    for raw in ["\"4\"", "4.2", "\" 4 \"", "1.0"]:
+      expect EscrowError:
+        discard parseDecision(parseJson(
+          """{"give": [{"to": "%YOU%", "n": %N%, "good": "ORE"}]}"""
+            .replace("%YOU%", you).replace("%N%", raw)), sim, me)
 
-    ## Entries past the cap are DROPPED, not fatal.
-    let many = parseDecision(parseJson("""
-      {"give": [{"to": "%YOU%", "n": 1, "good": "ORE"},
-                {"to": "%OTHER%", "n": 1, "good": "ORE"},
-                {"to": "%YOU%", "n": 9, "good": "ORE"}],
-       "sign": ["C1", "C2", "C3"]}
-    """.replace("%YOU%", you).replace("%OTHER%", other)), sim, me)
-    check many.gives.len == MaxGives
-    check many.gives[1].to == sim.seatOfProfile[pForester]
-    check many.signs == @["C1", "C2"]
+    ## Over-cap gives, signings, and offers are rejected, not silently dropped.
+    expect EscrowError:
+      discard parseDecision(parseJson("""
+        {"give": [{"to": "%YOU%", "n": 1, "good": "ORE"},
+                  {"to": "%OTHER%", "n": 1, "good": "ORE"},
+                  {"to": "%YOU%", "n": 9, "good": "ORE"}]}
+      """.replace("%YOU%", you).replace("%OTHER%", other)), sim, me)
+    expect EscrowError:
+      discard parseDecision(parseJson("""{"sign": ["C1", "C2", "C3"]}"""), sim, me)
+    expect EscrowError:
+      discard parseDecision(%*{"offer": "🐐".repeat(400)}, sim, me)
 
-    ## Over-cap free text is truncated on RUNE boundaries, never bytes.
+    ## Unknown keys and wrong field types are rejected, never silently ignored.
+    for bad in [
+      """{"ignored": 1}""",
+      """{"signs": ["C1"]}""",
+      """{"notes": null}""",
+      """{"notes": false}""",
+      """{"say": 123}""",
+      """{"offer": 123}""",
+      """{"sign": "C1"}""",
+      """{"give": {"to": "%YOU%", "n": 1, "good": "ORE"}}""".replace("%YOU%", you),
+      """{"give": [{"to": "%YOU%", "n": 1, "good": "ORE", "extra": 1}]}""".replace("%YOU%", you),
+    ]:
+      expect EscrowError:
+        discard parseDecision(parseJson(bad), sim, me)
+
+    ## Over-cap free text (`say` / `notes`) is truncated on RUNE boundaries.
     let long = parseDecision(%*{
       "say": "é".repeat(400) & "🐐",
-      "notes": "ü".repeat(900) & "🐐",
-      "offer": "🐐".repeat(400)
+      "notes": "ü".repeat(900) & "🐐"
     }, sim, me)
     check long.say.runeLen == MaxSayLen
     check long.say.validateUtf8() == -1
     check long.notes.runeLen == MaxNotesLen
     check long.notes.validateUtf8() == -1
-    check long.offer.runeLen == MaxOfferChars
-    check long.offer.validateUtf8() == -1
     check cleanText("é".repeat(900), MaxNotesLen).runeLen == MaxNotesLen
     check cleanText("é".repeat(900), MaxSayLen).runeLen == MaxSayLen
 
@@ -299,33 +328,34 @@ suite "scripted baselines":
     expect EscrowError:
       discard parseDecision(parseJson("""{"sign": [3]}"""), sim, me)
 
-    ## Prose replies never reach the decision parser at all.
-    let fenced = extractJsonObject(
-      "Sure, here you go:\n```json\n{\"sign\": [\"C1\"]}\n```")
-    check fenced{"sign"}.len == 1
-    expect EscrowError:
-      discard extractJsonObject("I will hold my stock this turn.")
-
-    ## Anything AFTER the object is ignored: the object is the first
-    ## balanced one, not everything up to the last brace. Round 9 lost six
-    ## replies to "EOF expected" because a model signed off under its JSON.
-    let chatty = extractJsonObject(
-      "{\"sign\": [\"C4\"], \"say\": \"ore at 2.5\"}\n\nThat sale funds " &
-      "two fills, and I keep {my timber} for the commission.")
-    check chatty{"sign"}[0].getStr() == "C4"
-    check chatty{"say"}.getStr() == "ore at 2.5"
-    let twice = extractJsonObject(
-      "{\"sign\": [\"C1\"]}\nOn reflection: {\"sign\": [\"C2\"]}")
-    check twice{"sign"}[0].getStr() == "C1"
+    ## Single JSON object: bare, JSON-tagged fence, or plain fence are accepted.
+    let bare = extractJsonObject("  {\"sign\": [\"C1\"]}  ")
+    check bare{"sign"}.len == 1
+    let fencedJson = extractJsonObject("```json\n{\"sign\": [\"C1\"]}\n```")
+    check fencedJson{"sign"}.len == 1
+    let fencedPlain = extractJsonObject("```\n{\"sign\": [\"C1\"]}\n```")
+    check fencedPlain{"sign"}.len == 1
     ## Nested objects and braces inside strings are still one object.
     let nested = extractJsonObject(
       "{\"give\": [{\"to\": \"" & you & "\", \"n\": 1, \"good\": \"ORE\"}], " &
-      "\"notes\": \"a { in a string, and a \\\" quote\"}  trailing words")
+      "\"notes\": \"a { in a string, and a \\\" quote\"}")
     check nested{"give"}.len == 1
     check nested{"notes"}.getStr().startsWith("a { in a string")
-    ## An object that never closes is still no object at all.
-    expect EscrowError:
-      discard extractJsonObject("{\"sign\": [\"C1\"")
+
+    ## Surrounding prose, extra objects, non-JSON fences, and unclosed JSON are rejected.
+    for bad in [
+      "I will hold my stock this turn.",
+      "Sure, here you go:\n```json\n{\"sign\": [\"C1\"]}\n```",
+      "```json\n{\"sign\": [\"C1\"]}\n```\nDone.",
+      "```python\n{\"sign\": [\"C1\"]}\n```",
+      "{\"sign\": [\"C4\"], \"say\": \"ore at 2.5\"}\n\nTrailing prose.",
+      "{\"sign\": [\"C1\"]}\n{\"sign\": [\"C2\"]}",
+      "```json\n{\"sign\": [\"C1\"]}\n```\n```json\n{\"sign\": [\"C2\"]}\n```",
+      "{\"sign\": [\"C1\"",
+      "[1, 2, 3]"
+    ]:
+      expect EscrowError:
+        discard extractJsonObject(bad)
 
     ## The strict validator is what buys a seat its one retry.
     let illegal = parseDecision(parseJson(
@@ -341,27 +371,22 @@ suite "scripted baselines":
         """{"give": [{"to": "%ME%", "n": 1, "good": "ORE"}]}"""
           .replace("%ME%", sim.names[me])), sim, me)
 
-    ## `talk: false` silences `say` at the parser, not just at the sim.
+    ## `talk: false` rejects non-empty `say`, while allowing `{}` and `{"say": ""}`.
     let quiet = initSim(fixture(5, turns = 12, talk = false))
-    let hushed = parseDecision(parseJson("""{"say": "hello"}"""), quiet,
+    expect EscrowError:
+      discard parseDecision(parseJson("""{"say": "hello"}"""), quiet,
+        quiet.seatOfProfile[pMason])
+    let hushed = parseDecision(parseJson("""{"say": ""}"""), quiet,
       quiet.seatOfProfile[pMason])
     check hushed.say == ""
 
-  test "17. an exhausted LLM retry is recorded as scripted on the move":
-    ## The fallback has to reach the replay: phase 60 counts a seat played
-    ## by the house baseline off `move.scripted`, and a credentialed
-    ## episode whose replies keep failing is exactly the case the
-    ## registration-time flag misses. An unreachable endpoint (a refused
-    ## connection on the loopback discard port, no traffic off the box)
-    ## fails both attempt 0 and the retry in milliseconds.
+  test "17. an exhausted LLM retry forfeits the turn as an empty pass, never scripted":
     putEnv("AWS_ENDPOINT_URL_BEDROCK_RUNTIME", "http://127.0.0.1:1")
     putEnv("AWS_BEARER_TOKEN_BEDROCK", "not-a-real-token")
     let config = fixture(9, turns = 4)
     let client = newLlmClient(config)
     delEnv("AWS_ENDPOINT_URL_BEDROCK_RUNTIME")
     delEnv("AWS_BEARER_TOKEN_BEDROCK")
-    ## Credentials are present, so this is NOT the disabled path test 15
-    ## covers: every seat is registered LLM-driven and stays that way.
     check not client.disabled
     var sim = initSim(config)
     let seats = sim.pendingSeats()
@@ -370,18 +395,14 @@ suite "scripted baselines":
       @[skNone, skNone, skNone, skNone], PromptSelection())
     check decisions.len == seats.len
     for index, seat in seats:
-      let expected = scriptedAction(sim, seat, skTrader)
-      check decisions[index].scripted
-      check decisions[index].move.offer == expected.offer
-      check decisions[index].move.signs == expected.signs
-      check decisions[index].move.gives.len == expected.gives.len
+      check not decisions[index].scripted
+      check decisions[index].move == Move()
       sim.applyMove(seat, decisions[index].move, decisions[index].scripted)
     var moves = 0
     for event in sim.events:
       if event.kind == evMove:
         moves.inc
-        ## What the replay carries, and what phase 60 counts.
-        check event.scripted
+        check not event.scripted
     check moves == Seats
 
   test "18. an accepted model reply is recorded as the model's own":
