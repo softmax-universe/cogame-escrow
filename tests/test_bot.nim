@@ -393,7 +393,7 @@ suite "scripted baselines":
       quiet.seatOfProfile[pMason])
     check hushed.say == ""
 
-  test "17. an exhausted LLM retry reports infra failure, never scripted or empty pass":
+  test "17. a failed LLM transport reports infra failure in one turn, never scripted or empty pass":
     putEnv("AWS_ENDPOINT_URL_BEDROCK_RUNTIME", "http://127.0.0.1:1")
     putEnv("AWS_BEARER_TOKEN_BEDROCK", "not-a-real-token")
     let config = fixture(9, turns = 4)
@@ -475,6 +475,43 @@ suite "scripted baselines":
         if event.scripted: inc scriptedMoves else: inc modelMoves
     check scriptedMoves == 1
     check modelMoves == Seats - 1
+
+  test "18b. a rejected model reply fails in one model turn with no corrective resample":
+    var listener = newSocket()
+    listener.setSockOpt(OptReuseAddr, true)
+    listener.bindAddr(Port(0), "127.0.0.1")
+    listener.listen()
+    let port = listener.getLocalAddr()[1]
+    let reply = $ %*{
+      "content": [{"type": "text", "text": """{"sign": ["C99"]}"""}],
+      "stop_reason": "end_turn"
+    }
+    stubServed = 0
+    stubStop = false
+    var stub: Thread[tuple[fd: SocketHandle, reply: string]]
+    createThread(stub, stubServe, (fd: listener.getFd, reply: reply))
+
+    putEnv("AWS_ENDPOINT_URL_BEDROCK_RUNTIME", "http://127.0.0.1:" & $port.int)
+    putEnv("AWS_BEARER_TOKEN_BEDROCK", "stub-token")
+    var config = fixture(11, turns = 4)
+    config.llmTimeoutSeconds = 15
+    let client = newLlmClient(config)
+    delEnv("AWS_ENDPOINT_URL_BEDROCK_RUNTIME")
+    delEnv("AWS_BEARER_TOKEN_BEDROCK")
+    check not client.disabled
+
+    var sim = initSim(config)
+    let seats = sim.pendingSeats()
+    let decisions = client.decideAll(sim, seats, @["", "", "", ""],
+      @[skNone, skTrader, skTrader, skHoarder], PromptSelection())
+    stubStop = true
+    joinThread(stub)
+    listener.close()
+    ## Exactly one model turn for seat 0; no corrective resample retry.
+    check stubServed == 1
+    check decisions[0].failed
+    check decisions[0].failureKind == dfRejected
+    check "C99" in decisions[0].failureReason
 
   test "19. the turn view precomputes the sign decision":
     ## 22 of round 9's 35 rejected replies were "C<n> is not addressed to

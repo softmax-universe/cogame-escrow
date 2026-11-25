@@ -207,8 +207,7 @@ proc validateMove*(sim: Sim, seat: int, move: Move): string =
   ## "" when every part of `move` is legal against the floor as it stands,
   ## walked in the sim's own resolution order (signs, gives, then the
   ## offer). This is the strict probe an LLM reply must pass before it is
-  ## accepted; a reply that fails buys the seat one retry carrying exactly
-  ## this text.
+  ## accepted; a reply that fails terminates the unfinished episode unscored.
   if seat < 0 or seat >= Seats:
     return "bad seat"
   if move.gives.len > MaxGives:

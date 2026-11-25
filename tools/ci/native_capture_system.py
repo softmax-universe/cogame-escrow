@@ -652,10 +652,11 @@ def main():
                 "failed episode must not write numeric results.json"
             )
             failure = json.loads((output / "player_failure.json").read_text())
-            assert failure["status"] == "failed" and failure["failureKind"] in {
-                "infra",
-                "rejected",
-            }
+            assert set(failure.keys()) <= {"message", "failed_policy_index", "kind"}
+            assert isinstance(failure.get("message"), str) and 1 <= len(failure["message"]) <= 2000
+            assert type(failure.get("failed_policy_index")) is int and 0 <= failure["failed_policy_index"] < 4
+            if "kind" in failure:
+                assert failure["kind"] in {"player_error", "episode_inconclusive"}
             assert not errors
             assert (output / "trajectory.jsonl").is_file()
             print(

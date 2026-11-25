@@ -4,11 +4,11 @@
 ## plus that seat's prompt and asks Claude what it gives, offers, signs
 ## and says.
 ##
-## Decisions within a turn are simultaneous by rule, so the four requests
-## go out as ONE parallel batch (curly.makeRequests); invalid replies are
-## retried as a smaller batch carrying the exact error, and anything still
-## failing reports a decision failure so the server terminates the unfinished
-## episode unscored rather than substituting a scripted move or fake pass.
+## Decisions within a turn are simultaneous by rule, so the pending model
+## requests go out as ONE parallel batch (curly.makeRequests) with one model
+## turn per seat; any invalid or unavailable reply immediately reports a
+## decision failure so the server terminates the unfinished episode unscored
+## rather than running corrective resamples or substituting a scripted move.
 ##
 ## Credentials, in order of preference:
 ##   COWORLD_LLM_ENDPOINT            - hosted sidecar
@@ -442,7 +442,7 @@ proc signableBlock*(sim: Sim, seat: int): string =
     "other contract on the board belongs to other cogs and signing one is " &
     "rejected):\n"
   if lines.len == 0:
-    result.add("  (none this turn — leave \"sign\" empty)\n")
+    result.add("  (none this turn — omit \"sign\")\n")
   else:
     result.add(lines.join("\n") & "\n")
 
@@ -583,7 +583,7 @@ proc userPrompt*(sim: Sim, seat: int, prompt: string): string =
     (if sim.config.talk: ", say" else: "") & ", and the private \"notes\" string. " &
     "Omit unused fields. {} passes. Give example: " &
     "{\"give\":[{\"to\":\"" & sim.names[(seat+1) mod Seats] &
-    "\",\"n\":1,\"good\":\"ORE\"}]}. Sign using an available contract ID. ")
+    "\",\"n\":1,\"good\":\"ORE\"}]}. To sign, use a list of affordable IDs from SIGNABLE NOW, such as {\"sign\":[\"C1\"]}. ")
   if sim.turn + 1 < sim.config.turns:
     result.add("An offer is seven lines in one JSON string. Format example: " &
       $(%*{"offer": ["OFFER " & sim.names[(seat+1) mod Seats], "LOCK 1 ORE",
@@ -832,14 +832,13 @@ proc decideAll*(
 ): seq[SeatDecision] =
   ## One decision per seat in `seats`, in order, each tagged with whether
   ## a genuine scripted policy produced it or whether decision-making failed.
-  ## Rejected or unavailable model turns are never substituted with a scripted
-  ## bot or an empty pass; callers terminate the unfinished episode unscored.
+  ## Each model-driven seat gets one model turn per game turn (no corrective
+  ## resample loop). Rejected or unavailable model turns are never substituted
+  ## with a scripted bot or an empty pass; callers terminate the unfinished
+  ## episode unscored.
   ## `prompts` and `scripted` are indexed by SEAT.
   result = newSeq[SeatDecision](seats.len)
-  var open: seq[int]     ## indexes into `seats` still undecided
-  var hints = newSeq[string](seats.len)
-  var failureKinds = newSeq[DecisionFailureKind](seats.len)
-  var failureReasons = newSeq[string](seats.len)
+  var open: seq[int]     ## indexes into `seats` needing a model turn
   for index, seat in seats:
     let kind = scripted[seat]
     if kind != skNone:
@@ -855,80 +854,60 @@ proc decideAll*(
         failureReason: "no LLM credentials configured")
     else:
       open.add(index)
-  for attempt in 0 .. 1:
-    if open.len == 0 or client.disabled:
-      break
-    ## Decisions within a turn are simultaneous by rule, so every pending
-    ## seat goes out in ONE parallel batch: 16 turns is 16 round trips,
-    ## not 64.
-    var batch: RequestBatch
-    for index in open:
-      let seat = seats[index]
-      var user = sim.userPrompt(seat, prompts[seat])
-      if attempt > 0:
-        user.add("\n\nYour previous reply was invalid: " & hints[index] &
-          ". Respond with ONLY the requested JSON object.")
-      let request = client.requestFor(systemPrompt(sim, seat, selection), user, seat)
-      if seat < captures.len and captures[seat] != nil:
-        captures[seat].beginAttempt()
-        captures[seat].requested(request.body, request.headers)
-      batch.post(request.url, request.headers, request.body, $index)
-    var batchStarted: MonoTime
-    if captures.len > 0: batchStarted = getMonoTime()
-    let responses = client.curl.makeRequests(batch, client.timeoutSeconds)
-    let batchElapsedMs = if captures.len > 0:
-      (getMonoTime() - batchStarted).inMilliseconds.int else: 0
-    var stillOpen: seq[int]
-    for position, index in open:
-      let seat = seats[index]
-      let capture = if seat < captures.len: captures[seat] else: nil
-      if capture != nil:
-        capture.received(responses[position].response, responses[position].error, batchElapsedMs)
-      try:
-        let text = client.textOf(responses[position].response,
-          responses[position].error, batch[position].url)
-        var jsonText = ""
-        try:
-          jsonText = extractJsonObjectText(text)
-        except CatchableError:
-          discard
-        if capture != nil: capture.replyText(text, jsonText)
-        let decision = parseDecision(extractJsonObject(text), sim, seat)
-        ## Reject illegal replies here so the retry carries the hint. The
-        ## strict validator walks the sim's own resolution order on a copy
-        ## of this seat's stock.
-        let problem = sim.validateMove(seat, decision)
-        if problem.len > 0:
-          raise newException(EscrowError, problem)
-        result[index] = SeatDecision(move: decision, scripted: false)
-      except LlmInfraError as error:
-        if capture != nil: capture.rejectedAttempt(error.msg)
-        echo "escrow llm: seat ", seat, " attempt ", attempt, " infra failure: ",
-          error.msg
-        hints[index] = cleanText(error.msg, 300)
-        failureKinds[index] = dfInfra
-        failureReasons[index] = error.msg
-        stillOpen.add(index)
-      except CatchableError as error:
-        if capture != nil: capture.rejectedAttempt(error.msg)
-        echo "escrow llm: seat ", seat, " attempt ", attempt, " failed: ",
-          error.msg
-        hints[index] = cleanText(error.msg, 300)
-        failureKinds[index] = dfRejected
-        failureReasons[index] = error.msg
-        stillOpen.add(index)
-    open = stillOpen
+  if open.len == 0 or client.disabled:
+    return
+  ## Decisions within a turn are simultaneous by rule, so every pending
+  ## seat goes out in ONE parallel batch: one model turn per seat.
+  var batch: RequestBatch
   for index in open:
     let seat = seats[index]
-    let kind = if failureKinds[index] != dfNone: failureKinds[index] else: dfInfra
-    let reason = if failureReasons[index].len > 0: failureReasons[index]
-      elif client.disabled: "llm transport disabled"
-      else: "decision failed"
-    echo "escrow llm: seat ", seat, " failed after retries (", $kind, ": ",
-      reason, "); no substitute action"
-    result[index] = SeatDecision(
-      move: Move(),
-      scripted: false,
-      failed: true,
-      failureKind: kind,
-      failureReason: reason)
+    let user = sim.userPrompt(seat, prompts[seat])
+    let request = client.requestFor(systemPrompt(sim, seat, selection), user, seat)
+    if seat < captures.len and captures[seat] != nil:
+      captures[seat].beginAttempt()
+      captures[seat].requested(request.body, request.headers)
+    batch.post(request.url, request.headers, request.body, $index)
+  var batchStarted: MonoTime
+  if captures.len > 0: batchStarted = getMonoTime()
+  let responses = client.curl.makeRequests(batch, client.timeoutSeconds)
+  let batchElapsedMs = if captures.len > 0:
+    (getMonoTime() - batchStarted).inMilliseconds.int else: 0
+  for position, index in open:
+    let seat = seats[index]
+    let capture = if seat < captures.len: captures[seat] else: nil
+    if capture != nil:
+      capture.received(responses[position].response, responses[position].error, batchElapsedMs)
+    try:
+      let text = client.textOf(responses[position].response,
+        responses[position].error, batch[position].url)
+      var jsonText = ""
+      try:
+        jsonText = extractJsonObjectText(text)
+      except CatchableError:
+        discard
+      if capture != nil: capture.replyText(text, jsonText)
+      let decision = parseDecision(extractJsonObject(text), sim, seat)
+      ## Validate against the sim's own resolution order on a copy of this
+      ## seat's stock.
+      let problem = sim.validateMove(seat, decision)
+      if problem.len > 0:
+        raise newException(EscrowError, problem)
+      result[index] = SeatDecision(move: decision, scripted: false)
+    except LlmInfraError as error:
+      if capture != nil: capture.rejectedAttempt(error.msg)
+      echo "escrow llm: seat ", seat, " infra failure: ", error.msg
+      result[index] = SeatDecision(
+        move: Move(),
+        scripted: false,
+        failed: true,
+        failureKind: dfInfra,
+        failureReason: error.msg)
+    except CatchableError as error:
+      if capture != nil: capture.rejectedAttempt(error.msg)
+      echo "escrow llm: seat ", seat, " rejected: ", error.msg
+      result[index] = SeatDecision(
+        move: Move(),
+        scripted: false,
+        failed: true,
+        failureKind: dfRejected,
+        failureReason: error.msg)

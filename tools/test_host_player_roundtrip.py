@@ -6,12 +6,16 @@ across:
   1. Regular JSON + Markdown ```json fence + real Nov 25 long-notes/optional-defaults
      capture check (completes with genuine scores, model-produced action executed,
      raw text preserved, notes_clipped documented, applied action matches).
-  2. Invalid / ambiguous JSON object (surrounding prose / multiple objects) exhausting
-     retries -> non-zero exit, NO results.json, player_failure.json with failureKind=rejected,
-     private trajectory status=failed with participant_outcomes=null.
-  3. Provider failure (HTTP 500, and missing credentials) -> non-zero exit, NO results.json,
-     player_failure.json with failureKind=infra, private trajectory status=failed with
-     participant_outcomes=null.
+  2. Invalid / ambiguous JSON object (surrounding prose / multiple objects) or illegal
+     unfunded contract -> fails in ONE model turn (no corrective resample retry), non-zero
+     exit, NO results.json, canonical GamePlayerFailure player_failure.json
+     ({message, failed_policy_index}, extra forbidden), private trajectory status=failed
+     with participant_outcomes=null and preserved private failure diagnostics.
+  3. Provider failure (HTTP 500, and missing credentials) -> fails in ONE model turn,
+     non-zero exit, NO results.json, canonical GamePlayerFailure player_failure.json
+     ({message, failed_policy_index, kind=episode_inconclusive}, extra forbidden),
+     private trajectory status=failed with participant_outcomes=null and preserved
+     private failure diagnostics (failureKind=infra).
   4. Manifest certification contract (native model + every declared player ID seated,
      COWORLD_LLM_ENABLED + COWORLD_LLM_MODEL on native player and game runnable) plus
      a separate explicit offline scripted fixture (no LLM env) -> exit 0, genuine numeric
@@ -264,12 +268,30 @@ def test_regular_json_fence_and_clipped_notes(base: Path) -> None:
         server.shutdown()
 
 
+def assert_canonical_player_failure(
+    failure: dict, expected_slot: int, expected_kind: str = "player_error"
+) -> None:
+    """Enforce Coworld's closed GamePlayerFailure schema (extra=forbid)."""
+    allowed = {"message", "failed_policy_index", "kind"}
+    extra = set(failure.keys()) - allowed
+    assert not extra, f"forbidden extra keys in player_failure.json: {sorted(extra)}"
+    assert "message" in failure and isinstance(failure["message"], str)
+    assert 1 <= len(failure["message"]) <= 2000
+    assert "failed_policy_index" in failure
+    assert type(failure["failed_policy_index"]) is int
+    assert failure["failed_policy_index"] == expected_slot
+    if expected_kind == "player_error":
+        assert "kind" not in failure or failure["kind"] == "player_error"
+    else:
+        assert failure.get("kind") == expected_kind
+
+
 def test_invalid_ambiguous_object_fails_unscored(base: Path) -> None:
-    """Case 2: Invalid/ambiguous object (two JSON objects / prose) fails unscored."""
+    """Case 2: Invalid/ambiguous object (two JSON objects / prose) fails in one model turn."""
     def responder(slot, body, calls):
         return 200, '{"say": "first"} {"say": "second"}'
 
-    server, endpoint, _ = start_mock_llm(responder)
+    server, endpoint, calls = start_mock_llm(responder)
     try:
         work = base / "invalid-ambiguous"
         work.mkdir()
@@ -287,25 +309,72 @@ def test_invalid_ambiguous_object_fails_unscored(base: Path) -> None:
             capture=True,
         )
         assert rc != 0, "ambiguous object must fail episode"
+        assert len(calls) == 1, f"expected 1 model turn (no retry loop), got {len(calls)}"
         assert not (work / "results.json").exists(), "must not write numeric results on failure"
         failure = json.loads((work / "player_failure.json").read_text())
-        assert failure["status"] == "failed"
-        assert failure["failureKind"] == "rejected"
-        assert failure["seat"] == 0
+        assert_canonical_player_failure(failure, expected_slot=0, expected_kind="player_error")
         rows = [json.loads(l) for l in (work / "trajectory.jsonl").read_text().splitlines()]
         assert rows[-1]["status"] == "failed"
         assert rows[-1]["participant_outcomes"] is None
-        print("PASS case 2: invalid/ambiguous JSON object terminates unscored (failureKind=rejected)")
+        outcome = rows[-1]["outcome"]
+        assert outcome["status"] == "failed"
+        assert outcome["failureKind"] == "rejected"
+        assert outcome["seat"] == 0
+        assert outcome["turn"] == 0
+        assert outcome["error"]
+        print("PASS case 2: invalid/ambiguous JSON object fails in 1 turn with canonical GamePlayerFailure + private diagnostics")
+    finally:
+        server.shutdown()
+
+
+def test_unfunded_offer_first_rejection_single_turn(base: Path) -> None:
+    """Case 2b: Illegal unfunded offer fails immediately in one model turn with first rejection preserved."""
+    def responder(slot, body, calls):
+        offer = (
+            "OFFER Gizmo\nLOCK 99 ORE\nASK 1 GRAIN\nDUE 1\n"
+            "IF ALWAYS\nTHEN SWAP\nELSE KEEP"
+        )
+        return 200, json.dumps({"offer": offer})
+
+    server, endpoint, calls = start_mock_llm(responder)
+    try:
+        work = base / "unfunded-first-rejection"
+        work.mkdir()
+        rc, _ = run_episode(
+            work,
+            turns=4,
+            seed=11,
+            player_envs=[
+                {"COWORLD_LLM_ENABLED": "true"},
+                {"PLAYER_SCRIPTED": "trader"},
+                {"PLAYER_SCRIPTED": "trader"},
+                {"PLAYER_SCRIPTED": "hoarder"},
+            ],
+            llm_endpoint=endpoint,
+            capture=True,
+        )
+        assert rc != 0, "unfunded offer must fail episode"
+        assert len(calls) == 1, f"expected 1 model turn (no corrective resample), got {len(calls)}"
+        assert not (work / "results.json").exists()
+        failure = json.loads((work / "player_failure.json").read_text())
+        assert_canonical_player_failure(failure, expected_slot=0, expected_kind="player_error")
+        assert "unfunded" in failure["message"]
+        rows = [json.loads(l) for l in (work / "trajectory.jsonl").read_text().splitlines()]
+        assert rows[-1]["status"] == "failed"
+        assert rows[-1]["participant_outcomes"] is None
+        assert rows[-1]["outcome"]["failureKind"] == "rejected"
+        assert "unfunded" in rows[-1]["outcome"]["error"]
+        print("PASS case 2b: unfunded offer fails in 1 turn preserving first rejection + canonical GamePlayerFailure")
     finally:
         server.shutdown()
 
 
 def test_provider_failure_fails_unscored(base: Path) -> None:
-    """Case 3a: Provider HTTP 500 failure terminates unscored with failureKind=infra."""
+    """Case 3a: Provider HTTP 500 failure terminates unscored in one turn with episode_inconclusive."""
     def responder(slot, body, calls):
         return 500, "upstream provider error"
 
-    server, endpoint, _ = start_mock_llm(responder)
+    server, endpoint, calls = start_mock_llm(responder)
     try:
         work = base / "provider-http-500"
         work.mkdir()
@@ -323,19 +392,20 @@ def test_provider_failure_fails_unscored(base: Path) -> None:
             capture=True,
         )
         assert rc != 0, "provider 500 must fail episode"
+        assert len(calls) == 1, f"expected 1 model turn (no retry loop), got {len(calls)}"
         assert not (work / "results.json").exists(), "must not write numeric results on infra failure"
         failure = json.loads((work / "player_failure.json").read_text())
-        assert failure["status"] == "failed"
-        assert failure["failureKind"] == "infra"
-        assert failure["seat"] == 0
+        assert_canonical_player_failure(failure, expected_slot=0, expected_kind="episode_inconclusive")
         rows = [json.loads(l) for l in (work / "trajectory.jsonl").read_text().splitlines()]
         assert rows[-1]["status"] == "failed"
         assert rows[-1]["participant_outcomes"] is None
-        print("PASS case 3a: provider HTTP 500 terminates unscored (failureKind=infra)")
+        assert rows[-1]["outcome"]["failureKind"] == "infra"
+        assert rows[-1]["outcome"]["seat"] == 0
+        print("PASS case 3a: provider HTTP 500 terminates in 1 turn with canonical episode_inconclusive + private diagnostics")
     finally:
         server.shutdown()
 
-    """Case 3b: Missing LLM credentials for model player terminates unscored (failureKind=infra)."""
+    """Case 3b: Missing LLM credentials for model player terminates unscored with episode_inconclusive."""
     work = base / "missing-credentials"
     work.mkdir()
     rc, _ = run_episode(
@@ -354,13 +424,13 @@ def test_provider_failure_fails_unscored(base: Path) -> None:
     assert rc != 0, "missing credentials for model player must fail episode"
     assert not (work / "results.json").exists(), "must not write numeric results when creds missing"
     failure = json.loads((work / "player_failure.json").read_text())
-    assert failure["status"] == "failed"
-    assert failure["failureKind"] == "infra"
-    assert failure["seat"] == 0
+    assert_canonical_player_failure(failure, expected_slot=0, expected_kind="episode_inconclusive")
     rows = [json.loads(l) for l in (work / "trajectory.jsonl").read_text().splitlines()]
     assert rows[-1]["status"] == "failed"
     assert rows[-1]["participant_outcomes"] is None
-    print("PASS case 3b: missing LLM credentials terminates unscored (failureKind=infra)")
+    assert rows[-1]["outcome"]["failureKind"] == "infra"
+    assert rows[-1]["outcome"]["seat"] == 0
+    print("PASS case 3b: missing LLM credentials terminates with canonical episode_inconclusive + private diagnostics")
 
 
 def test_manifest_certification_and_offline_scripted(base: Path) -> None:
@@ -486,6 +556,7 @@ def main() -> None:
         base = Path(td)
         test_regular_json_fence_and_clipped_notes(base)
         test_invalid_ambiguous_object_fails_unscored(base)
+        test_unfunded_offer_first_rejection_single_turn(base)
         test_provider_failure_fails_unscored(base)
         test_manifest_certification_and_offline_scripted(base)
         test_nov25_real_trajectory_replay(base)
