@@ -200,8 +200,7 @@ proc failure(reason, message: string): ParseResult =
 
 proc parseContract*(text: string, sim: Sim, proposer: int): ParseResult =
   ## Parses AND validates one offer against the floor as it stands.
-  ## Every rejection carries a machine reason code so the retry batch can
-  ## quote the exact problem back to the model.
+  ## Every rejection carries a machine reason code and human explanation.
   if text.strip().len == 0:
     return failure("syntax", "the offer is empty")
   if text.runeLen > MaxOfferChars:

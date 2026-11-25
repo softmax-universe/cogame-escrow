@@ -39,6 +39,7 @@ import
 
 const
   MaxPromptLen = 4000
+  MaxPlayerFailureMessageRunes = 2000
   ReplayVersion = 1
 
 type
@@ -265,9 +266,11 @@ proc failEpisode(
   captures: seq[CapturedDecision] = @[]
 ) =
   ## Terminates an unfinished episode unscored with no invented scores, winner,
-  ## or payoff. Preserves failure diagnostics in logs, COGAME_PLAYER_FAILURE_URI
-  ## (if configured), and private trajectory capture (if configured).
-  var failurePayload: JsonNode
+  ## or payoff. Publishes the canonical GamePlayerFailure wire envelope to
+  ## COGAME_PLAYER_FAILURE_URI while preserving full private diagnostics in
+  ## logs, WebSocket error frames, and private trajectory capture.
+  var wireFailure: JsonNode
+  var privateDiagnostics: JsonNode
   withLock stateLock:
     if state.finished:
       return
@@ -277,14 +280,23 @@ proc failEpisode(
         state.config.players[seat].name
       else:
         ""
-    failurePayload = %*{
+    wireFailure = %*{
+      "failed_policy_index": seat,
+      "message": cleanText("seat " & $seat & " turn " & $turn & " (" &
+        failureKind & "): " & failureReason, MaxPlayerFailureMessageRunes)
+    }
+    if failureKind == "infra":
+      wireFailure["kind"] = %"episode_inconclusive"
+    privateDiagnostics = %*{
       "status": "failed",
       "reason": "player_failure",
       "failureKind": failureKind,
       "error": failureReason,
       "seat": seat,
       "policy": policyName,
-      "turn": turn
+      "turn": turn,
+      "failed_policy_index": wireFailure["failed_policy_index"],
+      "message": wireFailure["message"]
     }
     let errorFrame = $ %*{
       "type": "error",
@@ -305,14 +317,11 @@ proc failEpisode(
   if state.capture != nil:
     if captures.len > 0:
       state.capture.recordFailedTurn(captures, turn, seat, failureKind, failureReason)
-    state.capture.finishFailedCapture(failurePayload)
+    state.capture.finishFailedCapture(privateDiagnostics)
   let failureUri = getEnv("COGAME_PLAYER_FAILURE_URI").strip()
   if failureUri.len > 0:
     try:
-      writeArtifact(
-        failureUri, $failurePayload, "application/json",
-        "COGAME_PLAYER_FAILURE_METHOD"
-      )
+      writeArtifact(failureUri, $wireFailure, "application/json", "COGAME_PLAYER_FAILURE_METHOD")
     except CatchableError as error:
       echo "escrow: failed to write player failure artifact: ", error.msg
   sleep(200)
@@ -381,10 +390,10 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
     let playDeadline =
       if timeoutSeconds > 0.0: gameStart + timeoutSeconds * PlayBudgetFraction
       else: 0.0
-    ## Attempt 0 + one retry batch + applying the turn. Every wait in the
+    ## One model turn batch + applying the turn. Every wait in the
     ## turn is bounded by this, so the pre-turn check below can promise
     ## that starting a turn cannot overrun the play budget.
-    let maxTurnSeconds = 2.0 * config.llmTimeoutSeconds.float + 5.0
+    let maxTurnSeconds = config.llmTimeoutSeconds.float + 5.0
     if playDeadline > 0.0:
       echo "escrow: episode timeout ", timeoutSeconds.int, "s (",
         (if hostedTimeout.len > 0: "from env" else: "assumed"),
