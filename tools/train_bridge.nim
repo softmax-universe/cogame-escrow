@@ -98,7 +98,8 @@ proc decisionFor(choice: int): Move =
 proc step(command: JsonNode): JsonNode =
   if command["decision_id"].getInt() != decisionId:
     return %*{"kind": "rejected", "reason": "stale decision"}
-  let action = parseJson(command["response"].getStr())
+  let action = if textMode: extractJsonObject(command["response"].getStr())
+               else: parseJson(command["response"].getStr())
   let move = if textMode: parseDecision(action, view, seat) else: decisionFor(action["choice"].getInt())
   doAssert game.validateMove(seat, move) == ""
   game.applyMove(seat, move, true)

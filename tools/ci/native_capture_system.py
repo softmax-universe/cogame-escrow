@@ -20,29 +20,28 @@ from pathlib import Path
 from websockets.sync.client import connect
 
 
-def first_object(text):
-    start = text.find("{")
-    if start < 0:
+def extract_final_action_object(text):
+    lines = text.splitlines()
+    fence_lines = [
+        index for index, line in enumerate(lines) if line.strip().startswith("```")
+    ]
+    if not fence_lines:
+        body = text.strip()
+    else:
+        if len(fence_lines) != 2:
+            raise ValueError("expected one final fenced JSON object")
+        open_idx, close_idx = fence_lines
+        tag = lines[open_idx].strip()[3:].strip().lower()
+        if tag not in ("", "json"):
+            raise ValueError("unsupported fence tag")
+        if lines[close_idx].strip() != "```":
+            raise ValueError("invalid closing fence")
+        if any(line.strip() for line in lines[close_idx + 1 :]):
+            raise ValueError("trailing text after closing fence")
+        body = "\n".join(lines[open_idx + 1 : close_idx]).strip()
+    if not body or body[0] != "{" or body[-1] != "}":
         raise ValueError("no native object")
-    depth, quoted, escaped = 0, False, False
-    for index in range(start, len(text)):
-        char = text[index]
-        if quoted:
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == '"':
-                quoted = False
-        elif char == '"':
-            quoted = True
-        elif char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start : index + 1]
-    raise ValueError("unclosed native object")
+    return body
 
 
 def strict_object(text):
@@ -64,7 +63,9 @@ def strict_object(text):
             for item in value:
                 bounded(item, depth + 1)
 
-    value = json.loads(first_object(text), object_pairs_hook=pairs)
+    value = json.loads(extract_final_action_object(text), object_pairs_hook=pairs)
+    if not isinstance(value, dict):
+        raise ValueError("native object must be a JSON object")
     bounded(value)
     return value
 

@@ -243,12 +243,12 @@ proc rejectedAttempt*(capture: CapturedDecision, detail: string) =
   except CatchableError as error: capture.captureError(error.msg)
 
 proc strictRawObject(text: string): JsonNode =
-  ## Reused from Garble's reviewed native-capture strictRawObject; native gameplay decoder is unchanged.
+  ## Strictly parses one extracted raw JSON action object string with no
+  ## surrounding prose, duplicate keys, comments, or trailing tokens.
   if not scalarUtf8(text): raise newException(ValueError, "raw JSON is not Unicode scalar UTF-8")
-  let first = text.find('{')
-  let last = text.rfind('}')
-  if first < 0 or last < first: raise newException(ValueError, "no raw JSON object")
-  let source = text[first .. last]
+  let source = text.strip()
+  if source.len == 0 or source[0] != '{' or source[^1] != '}':
+    raise newException(ValueError, "no raw JSON object")
   var quoted = false
   var index = 0
   while index < source.len:

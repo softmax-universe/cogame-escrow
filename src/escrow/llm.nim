@@ -546,7 +546,7 @@ WORKED EXAMPLES (one statement per line in your reply, separated by \n):
       "is not binding and may or may not be honest.\n")
   result.add("- Your notes are private to you and fed back every turn.\n")
   result.add("""
-Choose your action as one JSON object.""")
+Send one JSON action. If you explain your plan, finish with the action in a JSON code block.""")
 
 proc operatorBlock(prompt: string): string =
   if prompt.len == 0:
@@ -579,46 +579,49 @@ proc userPrompt*(sim: Sim, seat: int, prompt: string): string =
   result.add("YOUR NOTES FROM EARLIER TURNS:\n" &
     (if sim.notes[seat].len > 0: sim.notes[seat] else: "(none)") & "\n\n")
   result.add(operatorBlock(prompt))
-  result.add("Choose any of give, offer, sign" &
-    (if sim.config.talk: ", say" else: "") & ", and the private \"notes\" string. " &
-    "Omit unused fields. {} passes. Give example: " &
-    "{\"give\":[{\"to\":\"" & sim.names[(seat+1) mod Seats] &
-    "\",\"n\":1,\"good\":\"ORE\"}]}. To sign, use a list of affordable IDs from SIGNABLE NOW, such as {\"sign\":[\"C1\"]}. ")
+  result.add("Use just the fields you need: give (list of {to, n, good}), " &
+    "sign (list of affordable contract IDs from SIGNABLE NOW), " &
+    (if sim.config.talk: "say (public message), " else: "") &
+    "and notes (private memory). {} passes.")
   if sim.turn + 1 < sim.config.turns:
-    result.add("An offer is seven lines in one JSON string. Format example: " &
-      $(%*{"offer": ["OFFER " & sim.names[(seat+1) mod Seats], "LOCK 1 ORE",
-          "ASK 1 GRAIN", "DUE " & $(sim.turn + 1), "IF ALWAYS", "THEN SWAP",
-          "ELSE KEEP"].join("\n")}) &
-      ". Choose goods and amounts from your free stock after gifts.")
+    let example = $(%*{"offer": ["OFFER " & sim.names[(seat+1) mod Seats],
+      "LOCK 1 ORE", "ASK 1 GRAIN", "DUE " & $(sim.turn + 1), "IF ALWAYS",
+      "THEN SWAP", "ELSE KEEP"].join("\n")})
+    result.add(" To post an offer, use one seven-line contract string. " &
+      "Choose terms you can fund after gifts and signings. Example:\n```json\n" &
+      example & "\n```")
   else:
-    result.add("This is the final turn. No new offer can settle.")
+    result.add(" This is the final turn. No new offer can settle.")
 
 # ---- Anthropic / Bedrock transport ------------------------------------------
 
-proc unwrapSingleJsonFence(text: string): tuple[ok: bool, body: string] =
-  ## Accepts either bare text or a single ordinary outer Markdown code fence
-  ## (``` or ```json, case-insensitive). Rejects other fence tags, unclosed
-  ## fences, or any text outside the fence.
-  let trimmed = text.strip()
-  if not trimmed.startsWith("```"):
-    return (true, trimmed)
-  let firstNewline = trimmed.find('\n')
-  if firstNewline < 0:
+proc unwrapFinalActionJson(text: string): tuple[ok: bool, body: string] =
+  ## Accepts either a bare JSON object or one complete final plain (```) or
+  ## JSON (```json, case-insensitive) Markdown fenced action following an
+  ## optional explanation. Rejects trailing text after the closing fence,
+  ## multiple fenced blocks, non-JSON fence tags, or unclosed fences.
+  let lines = text.splitLines()
+  var fenceLines: seq[int]
+  for index, line in lines:
+    if line.strip().startsWith("```"):
+      fenceLines.add(index)
+  if fenceLines.len == 0:
+    return (true, text.strip())
+  if fenceLines.len != 2:
     return (false, "")
-  let tag = trimmed[3 ..< firstNewline].strip().toLowerAscii()
+  let openIdx = fenceLines[0]
+  let closeIdx = fenceLines[1]
+  let openLine = lines[openIdx].strip()
+  let tag = openLine[3 .. ^1].strip().toLowerAscii()
   if tag.len > 0 and tag != "json":
     return (false, "")
-  if not trimmed.endsWith("```"):
+  if lines[closeIdx].strip() != "```":
     return (false, "")
-  let innerEnd = trimmed.len - 3
-  if innerEnd <= firstNewline:
-    return (false, "")
-  var lineStart = innerEnd - 1
-  while lineStart > firstNewline and trimmed[lineStart] in {' ', '\t'}:
-    dec lineStart
-  if trimmed[lineStart] != '\n':
-    return (false, "")
-  (true, trimmed[firstNewline + 1 ..< lineStart].strip())
+  for index in (closeIdx + 1) ..< lines.len:
+    if lines[index].strip().len > 0:
+      return (false, "")
+  let body = lines[openIdx + 1 ..< closeIdx].join("\n").strip()
+  (true, body)
 
 proc replyPreview(text: string): string =
   var head = text.strip()
@@ -627,10 +630,11 @@ proc replyPreview(text: string): string =
   head.replace("\n", " ")
 
 proc extractJsonObjectText*(text: string): string =
-  ## Extracts the single JSON object text from a bare reply or a single
-  ## ordinary outer Markdown code fence (```json or ```). Rejects surrounding
-  ## prose, extra objects, or non-object JSON.
-  let unwrapped = unwrapSingleJsonFence(text)
+  ## Extracts the single JSON object text from a bare reply or one complete
+  ## final plain or JSON Markdown fenced block following an optional
+  ## explanation. Rejects trailing text, extra objects/fences, non-JSON
+  ## fences, unclosed documents, or non-object JSON.
+  let unwrapped = unwrapFinalActionJson(text)
   if not unwrapped.ok or unwrapped.body.len == 0 or
       unwrapped.body[0] != '{' or unwrapped.body[^1] != '}':
     raise newException(EscrowError,
@@ -638,9 +642,10 @@ proc extractJsonObjectText*(text: string): string =
   unwrapped.body
 
 proc extractJsonObject*(text: string): JsonNode =
-  ## Parses exactly one JSON object from `text`, bare or inside a single
-  ## ordinary outer Markdown code fence (```json or ```). Rejects surrounding
-  ## prose, extra objects, or non-object JSON.
+  ## Parses exactly one JSON object from `text`, bare or inside one complete
+  ## final plain or JSON Markdown fenced block following an optional
+  ## explanation. Rejects trailing text, extra objects/fences, non-JSON
+  ## fences, unclosed documents, or non-object JSON.
   let body = extractJsonObjectText(text)
   try:
     result = parseJson(body)

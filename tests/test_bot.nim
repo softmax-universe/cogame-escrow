@@ -341,13 +341,27 @@ suite "scripted baselines":
     expect EscrowError:
       discard parseDecision(parseJson("""{"sign": [3]}"""), sim, me)
 
-    ## Single JSON object: bare, JSON-tagged fence, or plain fence are accepted.
+    ## Single JSON object: bare, JSON-tagged fence, plain fence, or natural-language
+    ## explanation before one final plain/JSON fenced action are accepted.
     let bare = extractJsonObject("  {\"sign\": [\"C1\"]}  ")
     check bare{"sign"}.len == 1
     let fencedJson = extractJsonObject("```json\n{\"sign\": [\"C1\"]}\n```")
     check fencedJson{"sign"}.len == 1
     let fencedPlain = extractJsonObject("```\n{\"sign\": [\"C1\"]}\n```")
     check fencedPlain{"sign"}.len == 1
+    let reasonedOfferText =
+      "I need to analyze this turn and plan my strategy.\n\n" &
+      "**Current Situation:**\n- I hold surplus ORE and need GRAIN.\n\n" &
+      "```json\n" &
+      $(%*{"offer": "OFFER " & you & "\nLOCK 2 ORE\nASK 2 GRAIN\nDUE 1\nIF ALWAYS\nTHEN SWAP\nELSE KEEP",
+           "say": "2 ore for 2 grain"}) &
+      "\n```\n"
+    let reasonedOffer = parseDecision(extractJsonObject(reasonedOfferText), sim, me)
+    check reasonedOffer.offer.startsWith("OFFER " & you)
+    check sim.validateMove(me, reasonedOffer) == ""
+    let reasonedPlainSign = parseDecision(extractJsonObject(
+      "Signing C1 gives me the grain I need.\n```\n{\"sign\": [\"C1\"]}\n```"), sim, me)
+    check reasonedPlainSign.signs == @["C1"]
     ## Nested objects and braces inside strings are still one object.
     let nested = extractJsonObject(
       "{\"give\": [{\"to\": \"" & you & "\", \"n\": 1, \"good\": \"ORE\"}], " &
@@ -355,17 +369,24 @@ suite "scripted baselines":
     check nested{"give"}.len == 1
     check nested{"notes"}.getStr().startsWith("a { in a string")
 
-    ## Surrounding prose, extra objects, non-JSON fences, and unclosed JSON are rejected.
+    ## Prose without a fence, trailing text, extra objects/fences, non-JSON fences,
+    ## and unclosed documents are rejected.
     for bad in [
       "I will hold my stock this turn.",
-      "Sure, here you go:\n```json\n{\"sign\": [\"C1\"]}\n```",
+      "Here is my move:\n{\"sign\": [\"C1\"]}",
       "```json\n{\"sign\": [\"C1\"]}\n```\nDone.",
       "```python\n{\"sign\": [\"C1\"]}\n```",
       "{\"sign\": [\"C4\"], \"say\": \"ore at 2.5\"}\n\nTrailing prose.",
+      "{\"sign\": [\"C1\"]} {\"sign\": [\"C2\"]}",
       "{\"sign\": [\"C1\"]}\n{\"sign\": [\"C2\"]}",
       "```json\n{\"sign\": [\"C1\"]}\n```\n```json\n{\"sign\": [\"C2\"]}\n```",
+      "First idea:\n```json\n{\"sign\": [\"C1\"]}\n```\nFinal idea:\n```json\n{\"sign\": [\"C2\"]}\n```",
+      "```json\n{\"sign\": [\"C1\"]}\n{\"sign\": [\"C2\"]}\n```",
+      "Let me plan.\n```json\n{\"sign\": [\"C1\"]}",
+      "Let me plan.\n```json\n{\"sign\": [\"C1\"\n```",
       "{\"sign\": [\"C1\"",
-      "[1, 2, 3]"
+      "[1, 2, 3]",
+      "```json\n[1, 2, 3]\n```"
     ]:
       expect EscrowError:
         discard extractJsonObject(bad)
