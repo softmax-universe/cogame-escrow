@@ -12,8 +12,10 @@ across:
   3. Provider failure (HTTP 500, and missing credentials) -> non-zero exit, NO results.json,
      player_failure.json with failureKind=infra, private trajectory status=failed with
      participant_outcomes=null.
-  4. Purely scripted offline certification from coworld_manifest_template.json (no LLM env)
-     -> exit 0, genuine numeric results.json.
+  4. Manifest certification contract (native model + every declared player ID seated,
+     COWORLD_LLM_ENABLED + COWORLD_LLM_MODEL on native player and game runnable) plus
+     a separate explicit offline scripted fixture (no LLM env) -> exit 0, genuine numeric
+     results.json.
 """
 
 import http.server
@@ -361,31 +363,48 @@ def test_provider_failure_fails_unscored(base: Path) -> None:
     print("PASS case 3b: missing LLM credentials terminates unscored (failureKind=infra)")
 
 
-def test_offline_scripted_certification(base: Path) -> None:
-    """Case 4: Manifest certification seats are purely scripted and complete offline."""
+def test_manifest_certification_and_offline_scripted(base: Path) -> None:
+    """Case 4: Verify manifest release certification seats every declared ID, and run an explicit offline scripted fixture."""
     manifest = json.loads(MANIFEST.read_text())
     players_by_id = {p["id"]: p for p in manifest["player"]}
-    # First player in manifest must be the native model player with COWORLD_LLM_ENABLED=true and no PLAYER_SCRIPTED.
+
+    # Game runnable performs server-side seat inference, so it must declare LLM env.
+    game_env = manifest["game"]["runnable"].get("env", {})
+    assert game_env.get("COWORLD_LLM_ENABLED") == "true"
+    assert game_env.get("COWORLD_LLM_MODEL"), "game.runnable.env must set default COWORLD_LLM_MODEL"
+
+    # First player in manifest must be the native model player with COWORLD_LLM_ENABLED=true,
+    # explicit default COWORLD_LLM_MODEL, and no PLAYER_SCRIPTED.
     first_player = manifest["player"][0]
+    assert first_player["id"] == "escrow-player"
     assert first_player["env"].get("COWORLD_LLM_ENABLED") == "true"
+    assert first_player["env"].get("COWORLD_LLM_MODEL"), "native player must set default COWORLD_LLM_MODEL"
     assert "PLAYER_SCRIPTED" not in first_player["env"]
 
+    # Release certification fixture must seat every declared manifest player ID.
     cert = manifest["certification"]
-    cert_envs = []
-    for seat in cert["players"]:
-        entry = players_by_id[seat["player_id"]]
-        assert "PLAYER_SCRIPTED" in entry.get("env", {}), (
-            f"certification seat {seat['player_id']} must be scripted"
-        )
-        cert_envs.append(dict(entry["env"]))
+    assert len(cert["players"]) == cert["game_config"]["num_agents"] == 4
+    seated_ids = {seat["player_id"] for seat in cert["players"]}
+    declared_ids = set(players_by_id.keys())
+    assert seated_ids == declared_ids, (
+        f"certification.players must seat every declared ID {declared_ids}, got {seated_ids}"
+    )
 
-    work = base / "offline-certification"
+    # Separate explicit offline scripted test fixture (no LLM env).
+    scripted_ids = ["escrow-trader", "escrow-trader", "escrow-trader", "escrow-hoarder"]
+    scripted_envs = []
+    for pid in scripted_ids:
+        entry = players_by_id[pid]
+        assert "PLAYER_SCRIPTED" in entry.get("env", {}), f"{pid} must be explicitly scripted"
+        scripted_envs.append(dict(entry["env"]))
+
+    work = base / "offline-scripted"
     work.mkdir()
     rc, _ = run_episode(
         work,
         turns=cert["game_config"]["turns"],
         seed=cert["game_config"]["seed"],
-        player_envs=cert_envs,
+        player_envs=scripted_envs,
         llm_endpoint=None,
         capture=False,
     )
@@ -395,7 +414,7 @@ def test_offline_scripted_certification(base: Path) -> None:
     assert results["reason"] == "complete"
     assert results["turns"] == cert["game_config"]["turns"]
     assert len(results["scores"]) == 4 and all(isinstance(s, int) for s in results["scores"])
-    print("PASS case 4: purely scripted offline certification completes with genuine scores")
+    print("PASS case 4: manifest certification contract valid + explicit offline scripted fixture completes")
 
 
 def test_nov25_real_trajectory_replay(base: Path) -> None:
@@ -468,7 +487,7 @@ def main() -> None:
         test_regular_json_fence_and_clipped_notes(base)
         test_invalid_ambiguous_object_fails_unscored(base)
         test_provider_failure_fails_unscored(base)
-        test_offline_scripted_certification(base)
+        test_manifest_certification_and_offline_scripted(base)
         test_nov25_real_trajectory_replay(base)
 
 

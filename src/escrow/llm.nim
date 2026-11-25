@@ -82,11 +82,9 @@ type
     apiKey: string          ## anthropic transport
     sidecarEndpoint: string
     bedrockEndpoint: string ## local Bedrock transport
-    bedrockModels: seq[string]  ## candidates, tried in order on denial
-    bedrockModel: int           ## index into bedrockModels
+    bedrockModelId: string  ## single configured Bedrock model id (no fallback)
     bedrockToken: string
-    model: string         ## direct-Anthropic transport only; Bedrock
-                          ## picks from bedrockModels instead
+    model: string         ## direct-Anthropic or sidecar model id
     maxOutputTokens: int
     timeoutSeconds: int
     disabled*: bool   ## true once credentials are known-unavailable
@@ -112,38 +110,19 @@ proc resolveApiKey(): string =
     echo "escrow llm: failed to fetch ANTHROPIC_API_KEY_URI: ", error.msg
     result = ""
 
-proc bedrockModelIds(): seq[string] =
-  ## Bedrock inference-profile candidates, tried in order. BEDROCK_MODEL
-  ## pins a single id; without it, fall through this list — model access is
-  ## a per-account Marketplace subscription, so an id that works in one
-  ## account 403s in another. The config "model" field is NOT
-  ## consulted here: it applies to the direct-Anthropic transport
-  ## only, and the haiku-first ordering below is a shared-capacity
-  ## decision that trumps per-game preference.
+const
+  DefaultBedrockModel* = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+
+proc bedrockModelId(): string =
+  ## Single Bedrock inference-profile id. BEDROCK_MODEL overrides the
+  ## default; there is no alternate-model fallback rotation.
   let pinned = getEnv("BEDROCK_MODEL").strip()
   if pinned.len > 0:
-    return @[pinned]
-  ## Haiku leads: hosted Bedrock capacity is shared account-wide and the
-  ## sonnet profiles run out of daily tokens first.
-  @[
-    "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-    "us.anthropic.claude-sonnet-4-6",
-    "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
-  ]
-
-proc tryNextBedrockModel(client: LlmClient, why: string): bool =
-  if client.transport != ltBedrock or
-      client.bedrockModel + 1 >= client.bedrockModels.len:
-    return false
-  client.bedrockModel.inc
-  echo "escrow llm: ", client.bedrockModels[client.bedrockModel - 1],
-    " unusable (", why, "); falling back to ",
-    client.bedrockModels[client.bedrockModel]
-  true
+    return pinned
+  DefaultBedrockModel
 
 proc bedrockUrl(client: LlmClient): string =
-  client.bedrockEndpoint & "/model/" &
-    client.bedrockModels[client.bedrockModel] & "/invoke"
+  client.bedrockEndpoint & "/model/" & client.bedrockModelId & "/invoke"
 
 proc newLlmClient*(config: GameConfig): LlmClient =
   result = LlmClient(
@@ -168,11 +147,11 @@ proc newLlmClient*(config: GameConfig): LlmClient =
       else: "https://bedrock-runtime." & region & ".amazonaws.com"
     result.transport = ltBedrock
     result.bedrockEndpoint = endpoint.strip(chars = {'/'}, leading = false)
-    result.bedrockModels = bedrockModelIds()
+    result.bedrockModelId = bedrockModelId()
     result.bedrockToken = bedrockToken
     result.curl = newCurly()
     echo "escrow llm: bedrock transport, model ",
-      result.bedrockModels[result.bedrockModel],
+      result.bedrockModelId,
       ", url ", result.bedrockUrl
     return
   result.apiKey = resolveApiKey()
@@ -705,23 +684,17 @@ proc requestFor(client: LlmClient, system, user: string, slot: int):
 
 proc textOf(client: LlmClient, response: Response, error, url: string):
     string =
-  ## The text of one batched reply, or an EscrowError describing why there
-  ## is none. Auth failures disable the client; model-access and throttle
-  ## failures rotate the Bedrock model for the next batch.
+  ## The text of one batched reply, or an LlmInfraError describing why there
+  ## is none. Auth failures disable the client; no alternate-model fallback.
   if error.len > 0:
     raise newException(LlmInfraError, "llm transport: " & error)
   if response.code == 401 or response.code == 403:
     let detail = response.body[0 .. min(response.body.high, 400)]
-    if "Model access is denied" in response.body and
-        client.tryNextBedrockModel("no model access"):
-      raise newException(LlmInfraError,
-        "bedrock model access denied: " & detail)
     client.disabled = true
     raise newException(LlmInfraError,
       "llm auth failed (" & $response.code & ") at " & url & ": " & detail)
   if response.code == 429:
     let detail = response.body[0 .. min(response.body.high, 300)]
-    discard client.tryNextBedrockModel("throttled")
     raise newException(LlmInfraError, "llm throttled (429): " & detail)
   if response.code < 200 or response.code >= 300:
     raise newException(LlmInfraError, "anthropic error " & $response.code &

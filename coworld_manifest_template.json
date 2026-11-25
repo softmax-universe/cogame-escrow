@@ -23,7 +23,10 @@
       "run": [
         "/bin/escrow"
       ],
-      "env": {},
+      "env": {
+        "COWORLD_LLM_ENABLED": "true",
+        "COWORLD_LLM_MODEL": "anthropic/claude-haiku-4.5"
+      },
       "source_url": "https://github.com/softmax-universe/cogame-escrow/tree/main"
     },
     "config_schema": {
@@ -101,7 +104,7 @@
           "default": 400
         },
         "model": {
-          "description": "Claude model for the direct-Anthropic transport (ANTHROPIC_API_KEY). Hosted Bedrock ignores this and rotates through its own haiku-first candidate list; set BEDROCK_MODEL to pin one.",
+          "description": "Claude model for the direct-Anthropic transport (ANTHROPIC_API_KEY). Hosted Bedrock uses BEDROCK_MODEL (defaulting to us.anthropic.claude-haiku-4-5-20251001-v1:0) with no alternate-model fallback.",
           "type": "string",
           "default": "claude-sonnet-5"
         },
@@ -302,7 +305,8 @@
         "/bin/escrow-player"
       ],
       "env": {
-        "COWORLD_LLM_ENABLED": "true"
+        "COWORLD_LLM_ENABLED": "true",
+        "COWORLD_LLM_MODEL": "anthropic/claude-haiku-4.5"
       },
       "resources": {
         "requests": {
@@ -440,7 +444,7 @@
     },
     "players": [
       {
-        "player_id": "escrow-trader"
+        "player_id": "escrow-player"
       },
       {
         "player_id": "escrow-trader"

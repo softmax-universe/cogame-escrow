@@ -49,6 +49,7 @@ type
     capture: RuntimeCapture
     prompts: seq[string]
     external: seq[bool]
+    registered: seq[bool]
     decisionId: int
     pendingActions: seq[JsonNode]
     externalErrors: seq[string]
@@ -329,23 +330,32 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
     let deadline = gameStart + config.playerConnectTimeoutSeconds
 
     while epochTime() < deadline:
-      var allConnected = false
+      var allReady = false
       withLock stateLock:
-        allConnected = state.playerSockets.len >= config.tokens.len
-      if allConnected:
+        if state.playerSockets.len >= config.tokens.len:
+          allReady = true
+          for slot in 0 ..< config.tokens.len:
+            if not state.registered[slot]:
+              allReady = false
+              break
+      if allReady:
         break
-      sleep(200)
+      sleep(50)
 
     var missingSlot = -1
+    var missingReason = ""
     withLock stateLock:
-      if state.playerSockets.len < config.tokens.len:
-        for slot in 0 ..< config.tokens.len:
-          if not state.playerSockets.hasKey(slot):
-            missingSlot = slot
-            break
+      for slot in 0 ..< config.tokens.len:
+        if not state.playerSockets.hasKey(slot):
+          missingSlot = slot
+          missingReason = "player slot " & $slot & " did not connect before timeout"
+          break
+        if not state.registered[slot]:
+          missingSlot = slot
+          missingReason = "player slot " & $slot & " connected but did not register before timeout"
+          break
     if missingSlot >= 0:
-      failEpisode(runtimeConfig, missingSlot, "missing",
-        "player slot " & $missingSlot & " did not connect before timeout", 0)
+      failEpisode(runtimeConfig, missingSlot, "missing", missingReason, 0)
 
     withLock stateLock:
       state.started = true
@@ -651,6 +661,7 @@ proc websocketHandler(
             raise newException(EscrowError, "unknown player control")
           withLock stateLock:
             state.external[slot] = true
+            state.registered[slot] = true
           return
         if payload{"type"}.getStr() == "action":
           withLock stateLock:
@@ -676,6 +687,7 @@ proc websocketHandler(
             state.prompts[slot] = prompt
             state.external[slot] = false
             state.scripted[slot] = scripted
+            state.registered[slot] = true
           echo "escrow: slot ", slot, " delivered a prompt (",
             prompt.len, " chars",
             (if scripted != skNone: ", scripted " & $scripted else: ""), ")"
@@ -757,6 +769,7 @@ proc runGameServer*(config: GameConfig, runtimeConfig: RuntimeConfig) =
   state.capture = newRuntimeCapture(state.sim, runtimeConfig.resultsUri, runtimeConfig.replayUri)
   state.prompts = newSeq[string](config.players.len)
   state.external = newSeq[bool](config.players.len)
+  state.registered = newSeq[bool](config.players.len)
   state.pendingActions = newSeq[JsonNode](config.players.len)
   state.externalErrors = newSeq[string](config.players.len)
   state.scripted = newSeq[ScriptKind](config.players.len)
