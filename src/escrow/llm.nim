@@ -546,7 +546,7 @@ WORKED EXAMPLES (one statement per line in your reply, separated by \n):
       "is not binding and may or may not be honest.\n")
   result.add("- Your notes are private to you and fed back every turn.\n")
   result.add("""
-Send one JSON action. If you explain your plan, finish with the action in a JSON code block.""")
+Reply with one JSON action object.""")
 
 proc operatorBlock(prompt: string): string =
   if prompt.len == 0:
@@ -595,45 +595,120 @@ proc userPrompt*(sim: Sim, seat: int, prompt: string): string =
 
 # ---- Anthropic / Bedrock transport ------------------------------------------
 
+proc findJsonObjectEnd(text: string, start: int): int =
+  ## Given `text[start] == '{'`, returns the index of the matching '}' while
+  ## respecting JSON strings and escapes, or -1 if unclosed.
+  var depth = 0
+  var inString = false
+  var escaped = false
+  for index in start ..< text.len:
+    let ch = text[index]
+    if inString:
+      if escaped:
+        escaped = false
+      elif ch == '\\':
+        escaped = true
+      elif ch == '"':
+        inString = false
+    else:
+      if ch == '"':
+        inString = true
+      elif ch == '{':
+        inc depth
+      elif ch == '}':
+        dec depth
+        if depth == 0:
+          return index
+  -1
+
+proc extractBareTrailingJsonObject(text: string): tuple[ok: bool, body: string] =
+  ## Accepts a bare JSON object or reasoning followed by one complete bare JSON
+  ## object at the end of `text`. Rejects trailing text, competing JSON objects,
+  ## or incomplete/non-object JSON.
+  let trimmed = text.strip()
+  if trimmed.len == 0 or trimmed[^1] != '}':
+    return (false, "")
+  if trimmed[0] == '{':
+    if findJsonObjectEnd(trimmed, 0) == trimmed.high:
+      return (true, trimmed)
+    return (false, "")
+  var objects: seq[tuple[startIdx, endIdx: int]]
+  var index = 0
+  while index < trimmed.len:
+    if trimmed[index] == '{':
+      let endIdx = findJsonObjectEnd(trimmed, index)
+      if endIdx >= 0:
+        var isObj = false
+        try:
+          isObj = parseJson(trimmed[index .. endIdx]).kind == JObject
+        except JsonParsingError:
+          isObj = false
+        if isObj:
+          objects.add((startIdx: index, endIdx: endIdx))
+          index = endIdx + 1
+          continue
+    inc index
+  if objects.len == 1 and objects[0].endIdx == trimmed.high:
+    return (true, trimmed[objects[0].startIdx .. objects[0].endIdx])
+  (false, "")
+
 proc unwrapFinalActionJson(text: string): tuple[ok: bool, body: string] =
-  ## Accepts either a bare JSON object or one complete final plain (```) or
-  ## JSON (```json, case-insensitive) Markdown fenced action following an
-  ## optional explanation. Rejects trailing text after the closing fence,
-  ## multiple fenced blocks, non-JSON fence tags, or unclosed fences.
+  ## Accepts a bare JSON object, reasoning followed by one bare JSON object,
+  ## or one complete final plain (```) or JSON (```json, case-insensitive)
+  ## Markdown fenced JSON object following optional reasoning — including when
+  ## the sole missing bytes are closing backticks. Rejects trailing text,
+  ## multiple fenced blocks, competing JSON objects, non-JSON fence tags, or
+  ## incomplete JSON.
   let lines = text.splitLines()
   var fenceLines: seq[int]
   for index, line in lines:
     if line.strip().startsWith("```"):
       fenceLines.add(index)
   if fenceLines.len == 0:
-    return (true, text.strip())
-  if fenceLines.len != 2:
+    return extractBareTrailingJsonObject(text)
+  if fenceLines.len > 2:
     return (false, "")
   let openIdx = fenceLines[0]
-  let closeIdx = fenceLines[1]
   let openLine = lines[openIdx].strip()
   let tag = openLine[3 .. ^1].strip().toLowerAscii()
   if tag.len > 0 and tag != "json":
     return (false, "")
-  if lines[closeIdx].strip() != "```":
-    return (false, "")
-  for index in (closeIdx + 1) ..< lines.len:
-    if lines[index].strip().len > 0:
+  var body: string
+  if fenceLines.len == 2:
+    let closeIdx = fenceLines[1]
+    if lines[closeIdx].strip() != "```":
       return (false, "")
-  let body = lines[openIdx + 1 ..< closeIdx].join("\n").strip()
+    for index in (closeIdx + 1) ..< lines.len:
+      if lines[index].strip().len > 0:
+        return (false, "")
+    body = lines[openIdx + 1 ..< closeIdx].join("\n").strip()
+  else:
+    ## Unclosed fence: accept only when the sole missing bytes are closing
+    ## backticks (omitted or partially written at the end).
+    var rawBody = lines[openIdx + 1 .. ^1].join("\n").strip()
+    var trailingTicks = 0
+    while rawBody.len > 0 and rawBody[^1] == '`' and trailingTicks < 3:
+      rawBody.setLen(rawBody.len - 1)
+      inc trailingTicks
+    body = rawBody.strip()
+  if body.len == 0 or body[0] != '{' or body[^1] != '}':
+    return (false, "")
+  if findJsonObjectEnd(body, 0) != body.high:
+    return (false, "")
   (true, body)
 
 proc replyPreview(text: string): string =
-  var head = text.strip()
-  if head.runeLen > 160:
-    head = head.runeSubStr(0, 160) & "..."
-  head.replace("\n", " ")
+  let trimmed = text.strip().replace("\n", " ")
+  if trimmed.runeLen <= 200:
+    return trimmed
+  trimmed.runeSubStr(0, 80) & " ... " &
+    trimmed.runeSubStr(trimmed.runeLen - 115, 115)
 
 proc extractJsonObjectText*(text: string): string =
-  ## Extracts the single JSON object text from a bare reply or one complete
-  ## final plain or JSON Markdown fenced block following an optional
-  ## explanation. Rejects trailing text, extra objects/fences, non-JSON
-  ## fences, unclosed documents, or non-object JSON.
+  ## Extracts the single JSON object text from a bare reply, reasoning followed
+  ## by one bare JSON object, or one final plain or JSON Markdown fenced block
+  ## (including when only closing backticks are missing). Rejects trailing text,
+  ## competing objects/fences, non-JSON fences, incomplete JSON, or non-object JSON.
   let unwrapped = unwrapFinalActionJson(text)
   if not unwrapped.ok or unwrapped.body.len == 0 or
       unwrapped.body[0] != '{' or unwrapped.body[^1] != '}':
@@ -642,10 +717,10 @@ proc extractJsonObjectText*(text: string): string =
   unwrapped.body
 
 proc extractJsonObject*(text: string): JsonNode =
-  ## Parses exactly one JSON object from `text`, bare or inside one complete
-  ## final plain or JSON Markdown fenced block following an optional
-  ## explanation. Rejects trailing text, extra objects/fences, non-JSON
-  ## fences, unclosed documents, or non-object JSON.
+  ## Parses exactly one JSON object from `text`, bare or after optional
+  ## reasoning (bare or inside one final plain or JSON Markdown fence,
+  ## including when only closing backticks are missing). Rejects trailing text,
+  ## competing objects/fences, non-JSON fences, incomplete JSON, or non-object JSON.
   let body = extractJsonObjectText(text)
   try:
     result = parseJson(body)

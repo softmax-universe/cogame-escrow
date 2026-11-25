@@ -341,14 +341,29 @@ suite "scripted baselines":
     expect EscrowError:
       discard parseDecision(parseJson("""{"sign": [3]}"""), sim, me)
 
-    ## Single JSON object: bare, JSON-tagged fence, plain fence, or natural-language
-    ## explanation before one final plain/JSON fenced action are accepted.
+    ## Single JSON object: bare, reasoning followed by one bare JSON object,
+    ## or one final plain/JSON Markdown fenced action (including when only
+    ## closing backticks are missing) are accepted.
     let bare = extractJsonObject("  {\"sign\": [\"C1\"]}  ")
     check bare{"sign"}.len == 1
+    let reasonedBare = extractJsonObject("Here is my move:\n{\"sign\": [\"C1\"]}")
+    check reasonedBare{"sign"}.len == 1
+    let reasonedBareWithBraces = extractJsonObject(
+      "Use {to, n, good} for gives.\n\n{\"sign\": [\"C1\"]}\n")
+    check reasonedBareWithBraces{"sign"}.len == 1
     let fencedJson = extractJsonObject("```json\n{\"sign\": [\"C1\"]}\n```")
     check fencedJson{"sign"}.len == 1
     let fencedPlain = extractJsonObject("```\n{\"sign\": [\"C1\"]}\n```")
     check fencedPlain{"sign"}.len == 1
+    let unclosedFenceJson = extractJsonObject(
+      "Let me plan.\n```json\n{\"sign\": [\"C1\"]}")
+    check unclosedFenceJson{"sign"}.len == 1
+    let partialClosingFence = extractJsonObject(
+      "Let me plan.\n```json\n{\"sign\": [\"C1\"]}\n``")
+    check partialClosingFence{"sign"}.len == 1
+    let unclosedFencePlain = extractJsonObject(
+      "Let me plan.\n```\n{\"sign\": [\"C1\"]}\n")
+    check unclosedFencePlain{"sign"}.len == 1
     let reasonedOfferText =
       "I need to analyze this turn and plan my strategy.\n\n" &
       "**Current Situation:**\n- I hold surplus ORE and need GRAIN.\n\n" &
@@ -369,20 +384,21 @@ suite "scripted baselines":
     check nested{"give"}.len == 1
     check nested{"notes"}.getStr().startsWith("a { in a string")
 
-    ## Prose without a fence, trailing text, extra objects/fences, non-JSON fences,
-    ## and unclosed documents are rejected.
+    ## Prose without a complete JSON object, trailing text, competing objects/fences,
+    ## non-JSON fences, and truncated/incomplete JSON are rejected.
     for bad in [
       "I will hold my stock this turn.",
-      "Here is my move:\n{\"sign\": [\"C1\"]}",
       "```json\n{\"sign\": [\"C1\"]}\n```\nDone.",
+      "Let me plan.\n```json\n{\"sign\": [\"C1\"]}\nDone.",
       "```python\n{\"sign\": [\"C1\"]}\n```",
       "{\"sign\": [\"C4\"], \"say\": \"ore at 2.5\"}\n\nTrailing prose.",
       "{\"sign\": [\"C1\"]} {\"sign\": [\"C2\"]}",
       "{\"sign\": [\"C1\"]}\n{\"sign\": [\"C2\"]}",
+      "First: {\"sign\": [\"C1\"]}\nSecond: {\"sign\": [\"C2\"]}",
       "```json\n{\"sign\": [\"C1\"]}\n```\n```json\n{\"sign\": [\"C2\"]}\n```",
       "First idea:\n```json\n{\"sign\": [\"C1\"]}\n```\nFinal idea:\n```json\n{\"sign\": [\"C2\"]}\n```",
       "```json\n{\"sign\": [\"C1\"]}\n{\"sign\": [\"C2\"]}\n```",
-      "Let me plan.\n```json\n{\"sign\": [\"C1\"]}",
+      "Let me plan.\n```json\n{\"sign\": [\"C1\"",
       "Let me plan.\n```json\n{\"sign\": [\"C1\"\n```",
       "{\"sign\": [\"C1\"",
       "[1, 2, 3]",

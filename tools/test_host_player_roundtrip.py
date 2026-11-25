@@ -247,9 +247,18 @@ def test_regular_json_fence_and_clipped_notes(base: Path) -> None:
                 + "\n```",
             )
         if turn == 2:
-            # Bare regular JSON preserved
-            return 200, json.dumps({"sign": affordable[:1], "say": "bare-json-turn-2"})
-        return 200, "```json\n" + json.dumps({"sign": affordable[:2], "say": "closing"}) + "\n```"
+            # Reasoning followed by a bare JSON object
+            return (
+                200,
+                "Quick check: signing affordable offer on turn 2.\n"
+                + json.dumps({"sign": affordable[:1], "say": "reasoned-bare-turn-2"}),
+            )
+        # Reasoning followed by a complete fenced JSON object missing only closing backticks
+        return (
+            200,
+            "Closing turn analysis.\n```json\n"
+            + json.dumps({"sign": affordable[:2], "say": "closing-no-backticks"}),
+        )
 
     server, endpoint, calls = start_mock_llm(responder)
     try:
@@ -336,7 +345,8 @@ def test_invalid_ambiguous_object_fails_unscored(base: Path) -> None:
             "two-fenced-documents",
             'First thought:\n```json\n{"say": "first"}\n```\nActually:\n```json\n{"say": "second"}\n```',
         ),
-        ("unclosed-fence", 'Planning my turn.\n```json\n{"say": "cut off"}'),
+        ("truncated-json-in-fence", 'Planning my turn.\n```json\n{"say": "cut off"'),
+        ("prose-only-no-action", "I need to analyze my situation carefully.\nNo action yet."),
         ("trailing-after-fence", 'Planning my turn.\n```json\n{"say": "ok"}\n```\nDone.'),
     ]
     for label, reply_text in bad_cases:
@@ -422,40 +432,41 @@ def test_unfunded_offer_first_rejection_single_turn(base: Path) -> None:
 
 
 def test_provider_failure_fails_unscored(base: Path) -> None:
-    """Case 3a: Provider HTTP 500 failure terminates unscored in one turn with episode_inconclusive."""
-    def responder(slot, body, calls):
-        return 500, "upstream provider error"
+    """Case 3a: Provider HTTP 500 and 503 failures terminate unscored in one turn with episode_inconclusive."""
+    for status_code in (500, 503):
+        def responder(slot, body, calls, code=status_code):
+            return code, f"upstream provider error {code}"
 
-    server, endpoint, calls = start_mock_llm(responder)
-    try:
-        work = base / "provider-http-500"
-        work.mkdir()
-        rc, _ = run_episode(
-            work,
-            turns=4,
-            seed=11,
-            player_envs=[
-                {"COWORLD_LLM_ENABLED": "true"},
-                {"PLAYER_SCRIPTED": "trader"},
-                {"PLAYER_SCRIPTED": "trader"},
-                {"PLAYER_SCRIPTED": "hoarder"},
-            ],
-            llm_endpoint=endpoint,
-            capture=True,
-        )
-        assert rc != 0, "provider 500 must fail episode"
-        assert len(calls) == 1, f"expected 1 model turn (no retry loop), got {len(calls)}"
-        assert not (work / "results.json").exists(), "must not write numeric results on infra failure"
-        failure = json.loads((work / "player_failure.json").read_text())
-        assert_canonical_player_failure(failure, expected_slot=0, expected_kind="episode_inconclusive")
-        rows = [json.loads(l) for l in (work / "trajectory.jsonl").read_text().splitlines()]
-        assert rows[-1]["status"] == "failed"
-        assert rows[-1]["participant_outcomes"] is None
-        assert rows[-1]["outcome"]["failureKind"] == "infra"
-        assert rows[-1]["outcome"]["seat"] == 0
-        print("PASS case 3a: provider HTTP 500 terminates in 1 turn with canonical episode_inconclusive + private diagnostics")
-    finally:
-        server.shutdown()
+        server, endpoint, calls = start_mock_llm(responder)
+        try:
+            work = base / f"provider-http-{status_code}"
+            work.mkdir()
+            rc, _ = run_episode(
+                work,
+                turns=4,
+                seed=11,
+                player_envs=[
+                    {"COWORLD_LLM_ENABLED": "true"},
+                    {"PLAYER_SCRIPTED": "trader"},
+                    {"PLAYER_SCRIPTED": "trader"},
+                    {"PLAYER_SCRIPTED": "hoarder"},
+                ],
+                llm_endpoint=endpoint,
+                capture=True,
+            )
+            assert rc != 0, f"provider {status_code} must fail episode"
+            assert len(calls) == 1, f"expected 1 model turn (no retry loop), got {len(calls)}"
+            assert not (work / "results.json").exists(), "must not write numeric results on infra failure"
+            failure = json.loads((work / "player_failure.json").read_text())
+            assert_canonical_player_failure(failure, expected_slot=0, expected_kind="episode_inconclusive")
+            rows = [json.loads(l) for l in (work / "trajectory.jsonl").read_text().splitlines()]
+            assert rows[-1]["status"] == "failed"
+            assert rows[-1]["participant_outcomes"] is None
+            assert rows[-1]["outcome"]["failureKind"] == "infra"
+            assert rows[-1]["outcome"]["seat"] == 0
+            print(f"PASS case 3a ({status_code}): provider HTTP {status_code} terminates in 1 turn with canonical episode_inconclusive + private diagnostics")
+        finally:
+            server.shutdown()
 
     """Case 3b: Missing LLM credentials for model player terminates unscored with episode_inconclusive."""
     work = base / "missing-credentials"

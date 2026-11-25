@@ -173,7 +173,7 @@ def main():
             request = json.loads(body.decode("utf8", errors="surrogateescape"))
             assert (
                 request["model"] == "local/unicode-sentinel"
-                and request["max_tokens"] == 1100
+                and request["max_tokens"] == 2048
             )
             user = request["messages"][0]["content"]
             turn, seat = (
