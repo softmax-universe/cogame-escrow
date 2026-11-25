@@ -1,6 +1,5 @@
 ## The scripted baselines must play whole episodes without ever proposing
-## an illegal action — they are both the no-credentials fallback (offline
-## certification) and fieldable policies, so this is the completion path.
+## an illegal action — they are explicitly fieldable policies for the offline game.
 ## The `trader` baseline must also be a partner worth beating: an episode
 ## of four traders has to mint materially more hearts than the autarky
 ## floor, or the price band is broken.

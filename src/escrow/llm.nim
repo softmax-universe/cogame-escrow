@@ -546,9 +546,7 @@ WORKED EXAMPLES (one statement per line in your reply, separated by \n):
       "is not binding and may or may not be honest.\n")
   result.add("- Your notes are private to you and fed back every turn.\n")
   result.add("""
-OUTPUT FORMAT: reply with ONLY one JSON object, nothing else - no analysis,
-no explanation, no markdown fences, no text before or after the object. Your
-reply must begin with the character { and end with }.""")
+Choose your action as one JSON object.""")
 
 proc operatorBlock(prompt: string): string =
   if prompt.len == 0:
@@ -581,17 +579,19 @@ proc userPrompt*(sim: Sim, seat: int, prompt: string): string =
   result.add("YOUR NOTES FROM EARLIER TURNS:\n" &
     (if sim.notes[seat].len > 0: sim.notes[seat] else: "(none)") & "\n\n")
   result.add(operatorBlock(prompt))
-  result.add("Reply with ONLY a JSON object of the form {\"give\": [{\"to\": " &
-    "\"<cog>\", \"n\": 4, \"good\": \"ORE\"}], \"offer\": \"OFFER <cog>\\n" &
-    "LOCK ...\", \"sign\": [\"C3\"]" &
-    (if sim.config.talk: ", \"say\": \"…\"" else: "") &
-    ", \"notes\": \"…\"} — at most " & $MaxGives & " gives (n 1.." &
-    $MaxUnits & "), at most one offer (" & $MaxOfferChars &
-    " characters), at most " & $MaxSigns & " signings" &
-    (if sim.config.talk: ", say at most " & $MaxSayLen &
-      " characters (or \"\")" else: "") &
-    ", notes at most " & $MaxNotesLen &
-    " characters. Every field is optional; {} means you pass this turn.")
+  result.add("Choose any of give, offer, sign" &
+    (if sim.config.talk: ", say" else: "") & ", and private notes. " &
+    "Omit unused fields. {} passes. Give example: " &
+    "{\"give\":[{\"to\":\"" & sim.names[(seat+1) mod Seats] &
+    "\",\"n\":1,\"good\":\"ORE\"}]}. Sign using an available contract ID. ")
+  if sim.turn + 1 < sim.config.turns:
+    result.add("An offer is seven lines in one JSON string. Format example: " &
+      $(%*{"offer": ["OFFER " & sim.names[(seat+1) mod Seats], "LOCK 1 ORE",
+          "ASK 1 GRAIN", "DUE " & $(sim.turn + 1), "IF ALWAYS", "THEN SWAP",
+          "ELSE KEEP"].join("\n")}) &
+      ". Choose goods and amounts from your free stock after gifts.")
+  else:
+    result.add("This is the final turn. No new offer can settle.")
 
 # ---- Anthropic / Bedrock transport ------------------------------------------
 
