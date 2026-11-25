@@ -580,7 +580,7 @@ proc userPrompt*(sim: Sim, seat: int, prompt: string): string =
     (if sim.notes[seat].len > 0: sim.notes[seat] else: "(none)") & "\n\n")
   result.add(operatorBlock(prompt))
   result.add("Choose any of give, offer, sign" &
-    (if sim.config.talk: ", say" else: "") & ", and private notes. " &
+    (if sim.config.talk: ", say" else: "") & ", and the private \"notes\" string. " &
     "Omit unused fields. {} passes. Give example: " &
     "{\"give\":[{\"to\":\"" & sim.names[(seat+1) mod Seats] &
     "\",\"n\":1,\"good\":\"ORE\"}]}. Sign using an available contract ID. ")
@@ -730,9 +730,8 @@ proc parseDecision*(payload: JsonNode, sim: Sim, seat: int): Decision =
   ## over-cap actions are rejected instead of silently coerced or dropped.
   if payload.isNil or payload.kind != JObject:
     raise newException(EscrowError, "reply must be a JSON object")
-  for key in payload.keys:
-    if key notin ["give", "offer", "sign", "say", "notes"]:
-      raise newException(EscrowError, "unknown action field: \"" & key & "\"")
+  if not hasUnambiguousAction(payload):
+    raise newException(EscrowError, "reply must identify one documented action")
   if payload.hasKey("notes"):
     let node = payload["notes"]
     if node.kind != JString:

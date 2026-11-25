@@ -287,7 +287,10 @@ suite "scripted baselines":
     expect EscrowError:
       discard parseDecision(%*{"offer": "🐐".repeat(400)}, sim, me)
 
-    ## Unknown keys and wrong field types are rejected, never silently ignored.
+    let gift = parseDecision(%*{"give":[{"to":you,"n":1,"good":"ORE"}],
+      "comment":"my extra description"}, sim, me)
+    check gift.gives.len == 1
+    ## Unrecognized actions and wrong field types are rejected.
     for bad in [
       """{"ignored": 1}""",
       """{"signs": ["C1"]}""",
